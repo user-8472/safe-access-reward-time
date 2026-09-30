@@ -1,9 +1,11 @@
 #!/bin/sh
 # This must always run as __APP_USER__, never root - it starts an internet-facing
-# process. crond on Synology routers does NOT reliably honor the "who" column in
-# /etc/crontab, so the crontab entry invoking this script explicitly does
-# `su __APP_USER__ -c ...` rather than relying on that column. This self-check is
-# a second layer of defense in case it's ever invoked as root some other way.
+# process. The crontab entry invoking this script uses "root" as its "who"
+# column, not __APP_USER__: a controlled test (two identical entries added,
+# one as root and one as a regular user) confirmed this router's reboot
+# strips any crontab entry whose "who" column isn't "root". So this script
+# always self-corrects to __APP_USER__ internally instead of relying on
+# crond to invoke it as the right user in the first place.
 if [ "$(id -un)" != "__APP_USER__" ]; then
   exec su __APP_USER__ -c "$0 $*"
 fi

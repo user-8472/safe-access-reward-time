@@ -128,7 +128,11 @@ chmod 755 /usr/local/etc/rc.d/reward-time.sh /usr/local/etc/rc.d/reward-apply.sh
 /usr/local/etc/rc.d/reward-time.sh start
 
 # 2) Add the watchdog cron entries (keeps both services running):
-printf '*/1\t*\t*\t*\t*\t$APP_USER\t$APP_DIR/watchdog.sh\n' >> /etc/crontab
+# Both use "root" as the "who" column, even though watchdog.sh actually runs
+# the app as $APP_USER internally - confirmed via a controlled test (two
+# identical entries added, one as root and one as a regular user) that this
+# router's reboot strips any crontab entry whose "who" column isn't "root".
+printf '*/1\t*\t*\t*\t*\troot\t$APP_DIR/watchdog.sh\n' >> /etc/crontab
 printf '*/1\t*\t*\t*\t*\troot\t$APP_DIR/apply_watchdog.sh\n' >> /etc/crontab
 
 # 3) Verify it's running:
