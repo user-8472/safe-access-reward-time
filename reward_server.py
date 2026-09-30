@@ -4,6 +4,7 @@ import BaseHTTPServer
 import SocketServer
 import binascii
 import cgi
+import hmac
 import json
 import logging
 import logging.handlers
@@ -17,6 +18,12 @@ import urlparse
 
 REQUEST_TIMEOUT_SECONDS = 20
 
+# Anything this process creates from here on (tokens.db, pending/*.json request
+# files) defaults to owner-only. Files apply_daemon.py (root) creates are a
+# separate process with its own umask - unaffected, and must stay readable by
+# this user, so this is deliberately not touched there.
+os.umask(0o077)
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, 'config.json')
 
@@ -24,7 +31,7 @@ with open(CONFIG_PATH) as f:
     CONFIG = json.load(f)
 
 DB_PATH = CONFIG['db_path']
-TOKEN = CONFIG['token']
+TOKEN = str(CONFIG['token'])  # plain str/bytes, not unicode - hmac.compare_digest requires matching types
 PORT = CONFIG['port']
 
 log = logging.getLogger('reward_server')
@@ -53,7 +60,7 @@ def get_tokens_db():
 
 
 def is_admin_token(supplied):
-    return len(supplied) == len(TOKEN) and supplied == TOKEN
+    return len(supplied) == len(TOKEN) and hmac.compare_digest(supplied, TOKEN)
 
 
 def is_token_valid(supplied):
@@ -151,6 +158,7 @@ def get_profiles():
 PENDING_DIR = os.path.join(APP_DIR, 'pending')
 APPLY_TIMEOUT_SECONDS = 5
 REQUEST_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+TOKEN_REDACT_RE = re.compile(r'(token=)[^&\s"]+')
 
 
 def safe_request_id(request_id):
@@ -399,6 +407,12 @@ var selectedMinute = 0;
 var selectedAmPm = 'AM';
 
 function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+function escapeHtml(s) {
+  var div = document.createElement('div');
+  div.textContent = String(s);
+  return div.innerHTML;
+}
 
 function sameDay(a, b) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
@@ -696,7 +710,7 @@ function render(profiles) {
       '<button class="move" data-move-id="' + p.id + '" data-dir="down"' + (idx === ordered.length - 1 ? ' disabled' : '') + '>&#9660;</button>' +
       '</div>';
     var untilRow = '<button class="custom-btn" data-open-reward-picker="' + p.id + '">Custom</button>';
-    card.innerHTML = '<div class="card-head" data-card-id="' + p.id + '"><div class="name">' + p.name + '</div>' + moveBtns + '</div>' +
+    card.innerHTML = '<div class="card-head" data-card-id="' + p.id + '"><div class="name">' + escapeHtml(p.name) + '</div>' + moveBtns + '</div>' +
                       '<div class="remaining" data-remaining="' + p.id + '">' + remainingText + '</div>' +
                       '<div class="btns">' + btns + untilRow + revokeBtnHtml + '</div>';
     el.appendChild(card);
@@ -740,7 +754,7 @@ function loadGuestTokens() {
       el.innerHTML = tokens.map(function (t) {
         var expiresStr = new Date(t.expires_at * 1000).toLocaleString([],
           { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-        return '<div class="guest-row"><div><div class="label">' + t.label + '</div>' +
+        return '<div class="guest-row"><div><div class="label">' + escapeHtml(t.label) + '</div>' +
                '<div class="expires">until ' + expiresStr + '</div></div>' +
                '<div class="guest-row-btns">' +
                '<button class="copy-guest" data-copy-guest="' + t.token + '">Copy</button>' +
@@ -1183,8 +1197,18 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
 
         self._send_json({'error': 'not found'}, status=404)
 
+    def address_string(self):
+        # The stdlib default does a reverse-DNS lookup (socket.getfqdn()) with no
+        # timeout, on every single request - this app is internet-facing and gets
+        # hit by scanners constantly, so that's a real hang/resource risk. The raw
+        # IP is all this app ever needs for logging.
+        return self.client_address[0]
+
     def log_message(self, fmt, *args):
-        log.info("%s - %s", self.address_string(), fmt % args)
+        # Never let the bearer token reach the log - the default request-line
+        # logging includes the full query string, token and all.
+        msg = TOKEN_REDACT_RE.sub(r'\1REDACTED', fmt % args)
+        log.info("%s - %s", self.address_string(), msg)
 
 
 class ThreadingHTTPServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):

@@ -11,6 +11,7 @@
 # or anything requiring root - at the end it prints the exact commands you
 # run yourself, as root, to finish setup. Nothing is auto-elevated.
 set -e
+umask 077
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
@@ -107,7 +108,7 @@ for f in watchdog.sh reward-time-rcd.sh reward-apply-rcd.sh cert-sync.sh; do
 done
 chmod +x watchdog.sh apply_watchdog.sh cert-sync.sh reward-time-rcd.sh reward-apply-rcd.sh
 chmod +x reward_server.py apply_daemon.py 2>/dev/null || true
-chmod 600 cert/privkey.pem
+chmod 600 cert/privkey.pem config.json
 mkdir -p pending
 
 echo
