@@ -1,3 +1,13 @@
+I've wanted something better than the DS router app for configuring Safe 
+Access screen time for my kids.  I'd considered writing everything that is
+included here but new it would be a lot of work and I wasn't that committed.
+I realized yesterday that I could just ask Claude to write the app and here
+we are less than 36 hours in and it does everything I wanted. This note here
+is the only thing I've manually written for this project.  Everything else
+was generated through Claude Code. I hope it can be useful for someone else 
+in the future.
+
+
 # Safe Access Reward Time
 
 A small, self-hosted web app for adding "reward time" to a kid's device on a
