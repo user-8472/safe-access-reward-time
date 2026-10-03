@@ -1,13 +1,11 @@
 #!/bin/sh
-# This must always run as __APP_USER__, never root - it starts an internet-facing
-# process. The crontab entry invoking this script uses "root" as its "who"
-# column, not __APP_USER__: a controlled test (two identical entries added,
-# one as root and one as a regular user) confirmed this router's reboot
-# strips any crontab entry whose "who" column isn't "root". So this script
-# always self-corrects to __APP_USER__ internally instead of relying on
-# crond to invoke it as the right user in the first place.
+# Runs as __APP_USER__, never root - it starts an internet-facing process.
+# Root's crontab entry runs the root-owned app_watchdog.sh launcher (in the
+# root-owned install dir), which hands off to this script via su. Root must
+# never run anything from this directory itself: the app user can edit it.
 if [ "$(id -un)" != "__APP_USER__" ]; then
-  exec su __APP_USER__ -c "$0 $*"
+  echo "watchdog.sh must run as __APP_USER__, not $(id -un)" >&2
+  exit 1
 fi
 
 cd "$(dirname "$0")" || exit 1

@@ -60,9 +60,94 @@ SRM/DSM device with Safe Access, but router models vary - if something in
 here doesn't quite match what you see, that's likely why; the install
 script tries to warn you when a key assumption doesn't hold.
 
+## Setting up your router first
+
+If you've never enabled SSH, set up DDNS, or added a firewall rule on SRM
+before, this walks through all three - everything here is done through the
+same SRM web admin page you already use for Safe Access, logged in as an
+admin account.
+
+### 1. Enable SSH
+
+**Control Panel -> Terminal & SNMP -> Terminal** tab -> check **Enable SSH
+service** -> leave the port at `22` unless you have a reason to change it
+-> **Apply**.
+
+### 2. Connect over SSH for the first time
+
+You need a terminal/SSH client:
+
+- **Mac or Linux**: the `Terminal` app already has `ssh` built in.
+- **Windows 10/11**: `ssh` is built into PowerShell and Command Prompt -
+  open either one. (Or use a GUI tool like PuTTY if you prefer.)
+
+Connect using the same local IP address you normally use to open the SRM
+web interface (not a DDNS hostname - that comes next):
+
+```
+ssh your-admin-username@192.168.x.x
+```
+
+The first time, you'll see a warning that the host's authenticity can't be
+verified - type `yes` to continue. Then enter your admin password (the
+same one you use to log into SRM); nothing will appear on screen as you
+type, which is normal for password prompts. A prompt like `~$` means
+you're in.
+
+### 3. Set up DDNS
+
+Your router's public IP can change, so the app needs a stable hostname to
+be reachable from outside your home - this also solves the "my phone can't
+reach it when I'm away" problem that `https://192.168.x.x` addresses can't,
+since that address only works on your home network.
+
+**Control Panel -> External Access -> DDNS -> Add**:
+
+- **Service Provider**: `Synology` is the simplest option if you have a
+  Synology account - it gives you a free `something.synology.me` hostname
+  with nothing else to configure. A third-party provider (No-IP, etc.)
+  works too if you already have an account with one.
+- **Hostname**: pick anything available - it doesn't need to relate to
+  your real name. Anyone who later gets your app link will see this
+  hostname, though they'd also need the long random access token the
+  installer generates to actually do anything with it.
+- Follow whatever sign-in/verification step that provider asks for.
+- After saving, the **Status** column should turn to a green "Normal"
+  within a minute or so.
+
+Keep this hostname handy - the installer asks for it in the next section.
+
+### 4. Open the firewall for the app's port
+
+This uses the port you'll choose during installation (the installer
+defaults to `8443`), so you can do this step either now (using `8443`
+unless you plan to pick something else) or right after installing.
+
+**Control Panel -> Security -> Firewall**:
+
+- Make sure the firewall is enabled. If this is the first custom rule
+  you're adding, SRM may prompt you to create a default "allow" rule
+  first - that's fine, accept it.
+- Select the rule set for your main network interface (usually named
+  something like `LAN 1`), then **Edit Rules -> Create**.
+- Set **Ports** to **Custom**, protocol **TCP**, port `8443` (or your
+  chosen port); **Source IP** to **All**; **Action** to **Allow**.
+- **OK**, then **Save**. Make sure the new rule is enabled (checkbox) - if
+  you already have other custom rules, order only matters if an earlier
+  rule would otherwise block or shadow this one.
+
+Without this step, the app only works from inside your home network.
+
+**If your Synology device isn't your main internet gateway** - e.g. it's
+running in Access Point mode, or another router does your actual NAT/port
+forwarding - you'll also need to forward this same TCP port to this
+device's LAN IP address on *that* router. The steps for that vary by
+brand/model, so check that router's own documentation.
+
 ## Installing
 
-1. SSH into the device as your admin account (not root).
+1. SSH into the device as your admin account (not root) - see above if
+   you haven't enabled/used SSH on this device before.
 2. Pick a permanent home for the app and clone/copy this repo directly into
    it - it can't relocate itself afterward, so choose the real location up
    front. For example:
@@ -79,17 +164,15 @@ script tries to warn you when a key assumption doesn't hold.
    sh install.sh
    ```
 
-   It'll ask a few questions (HTTPS port, optionally your router's DDNS
-   hostname), generate a random access token and a self-signed certificate,
-   fill in the scripts with your settings, and then print out the handful
-   of commands that need root - copy/paste those into an `su` shell
-   yourself. Nothing is auto-elevated; you see and run every privileged
-   step.
+   It'll ask a few questions (HTTPS port, your router's DDNS hostname from
+   step 3 above), generate a random access token and a self-signed
+   certificate, fill in the scripts with your settings, and then print out
+   the handful of commands that need root - copy/paste those into an `su`
+   shell yourself. Nothing is auto-elevated; you see and run every
+   privileged step.
 
-4. In the SRM web interface, go to **Control Panel -> Security -> Firewall**
-   and add an **Allow** rule for the TCP port you chose (default `8443`)
-   from any source. Without this the app is only reachable from your home
-   network.
+4. If you haven't already, add the firewall rule from step 4 above for the
+   port you just chose.
 
 5. Open the URL the installer printed, bookmark it or add it to your
    phone's home screen.
@@ -106,16 +189,19 @@ Android device's equivalent.
 If your router already has Let's Encrypt (or another real) certificate for
 its own admin login page, `cert-sync.sh` can copy that into this app instead
 of the self-signed one, so there's no browser warning at all. It's already
-filled in with your settings from the installer. To use it:
+filled in with your settings from the installer, and was copied into the
+root-owned `<your-install-dir>-root` directory along with the other parts
+that run as root. To use it:
 
 ```
-su -c '<your-install-dir>/cert-sync.sh'
+su -c '<your-install-dir>-root/cert-sync.sh'
 ```
 
 and to keep it in sync automatically going forward, add (as root):
 
 ```
-printf '0\t6\t*\t*\t5\troot\t<your-install-dir>/cert-sync.sh\n' >> /etc/crontab
+printf '0\t6\t*\t*\t5\troot\t<your-install-dir>-root/cert-sync.sh\n' >> /etc/crontab
+/usr/syno/sbin/synoservicectl --restart crond
 ```
 
 (Friday mornings, a few hours after SRM's own certificate renewal check.)
@@ -126,18 +212,54 @@ no worse off than the self-signed default.
 
 ## Using it
 
-Open the app link. Each restricted profile gets a card: tap a preset for a
-quick add, **Custom** for an exact date/time, or **Revoke** to end active
-reward time early. Tap a card's header to collapse/expand it; use the small
-arrows to reorder cards (both remembered per-browser, not shared across
-devices).
+Open the app link. Each restricted Safe Access profile (a kid's account, or
+a specific device) gets its own collapsed card, showing whether it
+currently has active reward time:
 
-**Babysitter Access**: at the bottom, the "Add a token" card lets you name
-who it's for and pick a duration (or a custom date/time up to a year out).
-This generates a separate link with its own token - send it to whoever
-needs temporary access. It works exactly like your own link, except it
-can't create more tokens or see the token list. Revoke it anytime from the
-list below, or let it expire on its own.
+![Main list, collapsed](docs/screenshots/01-main-list.png)
+
+Tap a card's header to expand it:
+
+![Expanded card showing the quick-add buttons](docs/screenshots/02-expanded-card.png)
+
+This reveals four quick-add buttons - tap one for an instant grant. They
+stack: tap **+15m** then **+30m** right after and the device ends up with
+45 minutes total, with no need to wait for the first tap to finish before
+making the next one. There's also **Custom** for an exact date/time, and
+**Revoke** to end active reward time immediately. Use the small up/down
+arrows to reorder cards, and tap a header again to collapse it - both are
+remembered per-browser, not shared across devices.
+
+### Custom date & time
+
+Tapping **Custom** opens a picker sized to fit your screen without
+scrolling: pick a date from the calendar (it opens on today), then an
+hour, minute, and AM/PM, and tap **Set**.
+
+![Custom date and time picker](docs/screenshots/03-custom-picker.png)
+
+The picker closes immediately after you tap **Set** - it applies in the
+background, so you can move straight on to another device rather than
+waiting for it to finish.
+
+### Babysitter / guest access
+
+At the bottom, the "Add a token" card lets you name who a temporary access
+link is for and choose how long it should last - a preset number of hours
+or days, or an exact date/time up to a year out:
+
+![Add a token card](docs/screenshots/04-add-token.png)
+
+Creating one copies the link straight to your clipboard - ready to text or
+message to whoever needs it - and shows it in the list above. It works
+like your own link, except it can only grant or revoke reward time; it
+can't create more links or see this list. Tap an entry in the list to
+reveal its full link again later (handy if you need to resend it) - the
+text field is selectable so you can copy it manually:
+
+![An expanded token entry showing its selectable link](docs/screenshots/05-token-expanded.png)
+
+Revoke a token early right from its row, or just let it expire on its own.
 
 ## Architecture
 
@@ -175,14 +297,14 @@ unattended.
 ## Troubleshooting
 
 - **Nothing loads / connection refused from outside your home network**:
-  almost always the firewall rule from step 4 above, or your router's
-  public IP having changed with DDNS not yet caught up (check
-  **Control Panel -> External Access -> DDNS**, re-save the entry to force
-  an update).
+  almost always the firewall rule (see "Setting up your router first"
+  above), or your router's public IP having changed with DDNS not yet
+  caught up (check **Control Panel -> External Access -> DDNS**, re-save
+  the entry to force an update).
 - **Grant/revoke says success but the device doesn't actually get
   internet**: check that `apply_daemon.py` is actually running
-  (`ps w | grep apply_daemon.py`) and check `apply_daemon.log` in the app
-  directory for errors - most commonly this means the boot service wasn't
+  (`ps w | grep apply_daemon.py`) and check `apply_daemon.log` in the
+  `<your-install-dir>-root` directory for errors - most commonly this means the boot service wasn't
   installed correctly, or the root crontab watchdog entry is missing.
 - **"Failed - check connection" on a request**: as of this version this
   should be rare - errors now surface the server's actual reason (e.g. a
@@ -202,9 +324,10 @@ As root:
 rm /usr/local/etc/rc.d/reward-time.sh /usr/local/etc/rc.d/reward-apply.sh
 ```
 
-Then edit `/etc/crontab` to remove the three lines this app added
-(`watchdog.sh`, `apply_watchdog.sh`, and `cert-sync.sh` if you enabled it),
-and delete the app's install directory.
+Then edit `/etc/crontab` to remove the lines this app added
+(`app_watchdog.sh`, `apply_watchdog.sh`, and `cert-sync.sh` if you enabled
+it), restart crond (`/usr/syno/sbin/synoservicectl --restart crond`), and
+delete both the app's install directory and its `-root` companion.
 
 ## Security notes
 
@@ -218,9 +341,21 @@ and delete the app's install directory.
   per-connection timeouts, no endpoints beyond what it needs), but you
   should understand that's the tradeoff before exposing it.
 - `apply_daemon.py` runs as root, but its attack surface is narrow: it only
-  reads small JSON files from its own `pending/` directory (written only by
-  the unprivileged app, which validates and range-checks everything before
-  writing) and calls one fixed `synowebapi` command with those values.
+  reads small JSON files from the app's `pending/` directory (written only
+  by the unprivileged app, which validates and range-checks everything
+  before writing) and calls one fixed `synowebapi` command with those
+  values.
+- Everything that runs as root (`apply_daemon.py`, the two watchdog
+  launchers, `cert-sync.sh`) lives in a separate root-owned
+  `<your-install-dir>-root` directory, never in the app's own directory.
+  The app directory is writable by the app user - and so, in the worst
+  case, by anyone who compromises the internet-facing server - so if root
+  ran anything from there, that would be a path to root. For the same
+  reason, root never follows a path inside the app directory that could be
+  a planted symlink: `apply_daemon.py` reads requests with `O_NOFOLLOW` and
+  writes its status files via fresh, randomly named files, and
+  `cert-sync.sh` and the boot scripts do everything inside the app
+  directory as the app user (via `su`).
 
 ## License
 

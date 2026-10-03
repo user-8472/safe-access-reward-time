@@ -15,6 +15,10 @@ umask 077
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
+# The few parts that run as root get their own root-owned directory next to
+# this one - root must never run anything from a directory the app user can
+# write to, since that would hand the app user root.
+ROOT_DIR="$APP_DIR-root"
 
 echo "=== Safe Access Reward Time - installer ==="
 echo "Installing into: $APP_DIR"
@@ -39,6 +43,14 @@ if [ ! -f "$DEFAULT_DB_PATH" ]; then
   echo "Is the Safe Access package installed on this device? You can still" >&2
   echo "continue and fix the path in config.json afterward if needed." >&2
   echo
+fi
+
+PARENT_OWNER="$(ls -ld "$(dirname "$APP_DIR")" | awk '{print $3}')"
+if [ "$PARENT_OWNER" != "root" ]; then
+  echo "$(dirname "$APP_DIR") is owned by $PARENT_OWNER, not root." >&2
+  echo "Install into a directory directly under a root-owned one (e.g. /volume1)," >&2
+  echo "so the root-owned $ROOT_DIR alongside it can't be swapped out." >&2
+  exit 1
 fi
 
 APP_USER="$(id -un)"
@@ -98,16 +110,17 @@ cat > config.json << EOF
 EOF
 
 echo "Filling in scripts with your settings..."
-for f in watchdog.sh reward-time-rcd.sh reward-apply-rcd.sh cert-sync.sh; do
+for f in watchdog.sh root/apply_daemon.py root/apply_watchdog.sh root/app_watchdog.sh \
+         root/reward-time-rcd.sh root/reward-apply-rcd.sh root/cert-sync.sh; do
   sed -i \
     -e "s|__APP_USER__|$APP_USER|g" \
+    -e "s|__ROOT_DIR__|$ROOT_DIR|g" \
     -e "s|__APP_DIR__|$APP_DIR|g" \
     -e "s|__DDNS_HOSTNAME__|${DDNS_HOSTNAME:-localhost}|g" \
     -e "s|PORT=__HTTPS_PORT__|PORT=$HTTPS_PORT|g" \
     "$f"
 done
-chmod +x watchdog.sh apply_watchdog.sh cert-sync.sh reward-time-rcd.sh reward-apply-rcd.sh
-chmod +x reward_server.py apply_daemon.py 2>/dev/null || true
+chmod +x watchdog.sh reward_server.py
 chmod 600 cert/privkey.pem config.json
 mkdir -p pending
 
@@ -119,23 +132,34 @@ echo "(e.g. 'su' at an SSH prompt):"
 echo "=========================================================="
 cat << EOF
 
-# 1) Install both background services to start at boot:
-cp $APP_DIR/reward-time-rcd.sh /usr/local/etc/rc.d/reward-time.sh
-cp $APP_DIR/reward-apply-rcd.sh /usr/local/etc/rc.d/reward-apply.sh
+# 1) Copy the parts that run as root into their own root-owned directory -
+#    root never runs anything from $APP_DIR itself, since you (the app
+#    user) can write there:
+mkdir -m 755 $ROOT_DIR
+cp $APP_DIR/root/apply_daemon.py $APP_DIR/root/apply_watchdog.sh \\
+   $APP_DIR/root/app_watchdog.sh $APP_DIR/root/cert-sync.sh $ROOT_DIR/
+chown -R root:root $ROOT_DIR
+chmod 755 $ROOT_DIR/*
+
+# 2) Install both background services to start at boot:
+cp $APP_DIR/root/reward-time-rcd.sh /usr/local/etc/rc.d/reward-time.sh
+cp $APP_DIR/root/reward-apply-rcd.sh /usr/local/etc/rc.d/reward-apply.sh
 chown root:root /usr/local/etc/rc.d/reward-time.sh /usr/local/etc/rc.d/reward-apply.sh
 chmod 755 /usr/local/etc/rc.d/reward-time.sh /usr/local/etc/rc.d/reward-apply.sh
 /usr/local/etc/rc.d/reward-apply.sh start
 /usr/local/etc/rc.d/reward-time.sh start
 
-# 2) Add the watchdog cron entries (keeps both services running):
-# Both use "root" as the "who" column, even though watchdog.sh actually runs
-# the app as $APP_USER internally - confirmed via a controlled test (two
-# identical entries added, one as root and one as a regular user) that this
-# router's reboot strips any crontab entry whose "who" column isn't "root".
-printf '*/1\t*\t*\t*\t*\troot\t$APP_DIR/watchdog.sh\n' >> /etc/crontab
-printf '*/1\t*\t*\t*\t*\troot\t$APP_DIR/apply_watchdog.sh\n' >> /etc/crontab
+# 3) Add the watchdog cron entries (keeps both services running), then
+#    restart crond so it picks them up. Both use "root" as the "who" column -
+#    confirmed via a controlled test (two identical entries added, one as root
+#    and one as a regular user) that this router's reboot strips any crontab
+#    entry whose "who" column isn't "root". app_watchdog.sh drops to
+#    $APP_USER before running anything from $APP_DIR.
+printf '*/1\t*\t*\t*\t*\troot\t$ROOT_DIR/app_watchdog.sh\n' >> /etc/crontab
+printf '*/1\t*\t*\t*\t*\troot\t$ROOT_DIR/apply_watchdog.sh\n' >> /etc/crontab
+/usr/syno/sbin/synoservicectl --restart crond
 
-# 3) Verify it's running:
+# 4) Verify it's running:
 ps w | grep -E 'reward_server.py|apply_daemon.py' | grep -v grep
 
 EOF
