@@ -519,6 +519,18 @@ def set_schedule(profile_id, days, request_id):
     enqueue_and_wait('set_schedule', profile_id, request_id, blocktimes=blocks_from_on_windows(days))
 
 
+def profile_pause_state(profile_id):
+    # (paused, timed_until): timed_until is None for a pause with no end time
+    # (e.g. set from the DS router app) or when not paused.
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT pause_expired FROM config_group WHERE id = ?", (profile_id,)).fetchone()
+    finally:
+        conn.close()
+    paused = bool(row and row[0] is not None)
+    return paused, (load_pauses().get(profile_id) if paused else None)
+
+
 def pause_profile(profile_id, until, request_id):
     enqueue_and_wait('pause', profile_id, request_id, until=until)
 
@@ -1628,17 +1640,22 @@ PAGE_TEMPLATE = """<!doctype html>
   .card.collapsed .btns { display: none; }
   .card.collapsed .add-token-body { display: none; }
   .add-token-body { margin-top: 14px; }
-  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .btns { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .btns button { padding: 14px 0; font-size: 17px; }
   button { padding: 18px 0; border: none; border-radius: 10px; background: #0a84ff;
            color: white; font-size: 19px; font-weight: 700; }
   button:active { background: #0060df; }
-  .revoke { grid-column: 1 / -1; background: transparent; border: 1px solid #ff453a;
-            color: #ff453a; padding: 14px 0; font-size: 15px; margin-top: 2px; }
+  /* inset shadow rather than a border, so it lines up with the pause buttons beside it */
+  .btns .revoke { grid-column: span 2; background: transparent; box-shadow: inset 0 0 0 1px #ff453a;
+                  color: #ff453a; font-size: 15px; }
   .revoke:active { background: rgba(255, 69, 58, 0.15); }
   .card.collapsed .custom-btn { display: none; }
-  .custom-btn { grid-column: 1 / -1; background: #2c2c2e; margin-top: 2px; }
-  .pause-btn { background: #3a2a10; color: #ffb340; }
-  .pause-btn.resume { grid-column: 1 / -1; }
+  .btns .custom-btn { grid-column: span 2; background: #2c2c2e; font-size: 15px; }
+  .btns .custom-btn.wide { grid-column: 1 / -1; }
+  .btns .pause-btn { background: #3a2a10; color: #ffb340; font-size: 15px; }
+  /* two bars drawn in the text colour - the Unicode pause symbol shows as a coloured emoji on some phones */
+  .pause-icon { display: inline-block; width: 0.6em; height: 0.75em; border-left: 0.2em solid currentColor;
+                border-right: 0.2em solid currentColor; box-sizing: border-box; margin-right: 0.3em; vertical-align: -0.05em; }
   .paused-line { color: #ffb340; font-weight: 600; margin: -8px 0 12px; }
   .card.collapsed .paused-line { margin: 2px 0 0; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none;
@@ -1694,7 +1711,12 @@ PAGE_TEMPLATE = """<!doctype html>
   .sched-add { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
   .sched-add select { padding: 8px; font-size: 14px; background: #2c2c2e; color: #eee; border: none; border-radius: 8px; }
   .sched-add button { width: auto; padding: 8px 12px; font-size: 14px; }
-  .sched-btn { grid-column: 1 / -1; background: #2c2c2e; font-size: 15px; padding: 12px 0; }
+  .btns .sched-btn { grid-column: span 2; background: #2c2c2e; font-size: 15px; }
+  .section-head { display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+  .section-head .fold { color: #9b9ba1; font-size: 15px; transition: transform 0.15s; }
+  .section-head.folded .fold { transform: rotate(-90deg); }
+  .section-body.folded { display: none; }
+  .row-revoke { display: block; width: 100%; margin-top: 10px; padding: 10px 0; font-size: 14px; }
   .activity-undo { background: none; color: #0a84ff; width: auto; padding: 2px 0; font-size: 13px; }
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
            width: calc(100% - 32px); max-width: 448px; background: #30d158;
@@ -1721,7 +1743,8 @@ PAGE_TEMPLATE = """<!doctype html>
   .admin-email-row button { flex: none; width: auto; padding: 8px 12px; font-size: 13px; }
   .add-admin-btn { width: 100%; margin-top: 8px; padding: 12px 0; font-size: 15px; }
   .guest-scope { margin: 10px 0 2px; font-size: 14px; color: #b8b8bd; }
-  .guest-scope label { display: inline-flex; align-items: center; gap: 6px; margin: 0 14px 8px 0; }
+  .guest-scope label { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
+  .guest-scope .scope-list { margin-left: 26px; }
   .guest-scope input { width: 18px; height: 18px; }
   .activity-summary { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 12px; }
   .activity-summary th, .activity-summary td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #2c2c2e; }
@@ -1753,8 +1776,9 @@ PAGE_TEMPLATE = """<!doctype html>
     .schedule { font-size: 12px; margin: -6px 0 8px; }
     .add-token-body { margin-top: 10px; }
     .btns { gap: 7px; }
+    .btns button { padding: 11px 0; font-size: 15px; }
+    .btns .revoke, .btns .custom-btn, .btns .pause-btn, .btns .sched-btn { font-size: 13px; }
     button { padding: 11px 0; border-radius: 8px; font-size: 15px; }
-    .revoke { padding: 9px 0; font-size: 13px; }
     .modal-title { font-size: 16px; margin-bottom: 10px; }
     .spinner { width: 13px; height: 13px; margin-left: 5px; }
     .modal-status-line { font-size: 13px; margin: -6px 0 10px; }
@@ -1811,30 +1835,36 @@ PAGE_TEMPLATE = """<!doctype html>
 <div class="health-banner" id="health-banner" style="display:none"></div>
 <div id="cards"></div>
 <div id="admin-section" style="display:none">
-  <h2>Admin Links</h2>
-  <div id="admin-links-list"></div>
-  <div class="card collapsed" id="add-admin-card">
-    <div class="card-head" data-card-id="-2"><div class="name">Add an admin link</div></div>
-    <div class="add-token-body">
-      <input class="guest-label-input" id="admin-label" placeholder="Name (shows in activity)">
-      <input class="guest-label-input" id="admin-email" type="email" placeholder="Alert email (optional)">
-      <button class="add-admin-btn" id="add-admin-btn">Create admin link</button>
+  <h2 class="section-head" data-section="babysitter">Babysitter Access<span class="fold">&#9662;</span></h2>
+  <div class="section-body" data-section-body="babysitter">
+    <div id="guest-tokens-list"></div>
+    <div class="card" id="add-token-card">
+      <div class="card-head" data-card-id="-1"><div class="name">Add a token</div></div>
+      <div class="add-token-body">
+        <input class="guest-label-input" id="guest-label" placeholder="Who is this for? (e.g. Grandma)">
+        <div class="guest-scope" id="guest-scope"></div>
+        <div class="guest-duration-btns" id="guest-duration-btns"></div>
+      </div>
     </div>
   </div>
-  <h2>Babysitter Access</h2>
-  <div id="guest-tokens-list"></div>
-  <div class="card" id="add-token-card">
-    <div class="card-head" data-card-id="-1"><div class="name">Add a token</div></div>
-    <div class="add-token-body">
-      <input class="guest-label-input" id="guest-label" placeholder="Who is this for? (e.g. Grandma)">
-      <div class="guest-scope" id="guest-scope"></div>
-      <div class="guest-duration-btns" id="guest-duration-btns"></div>
+  <h2 class="section-head" data-section="admin">Admin Access<span class="fold">&#9662;</span></h2>
+  <div class="section-body" data-section-body="admin">
+    <div id="admin-links-list"></div>
+    <div class="card collapsed" id="add-admin-card">
+      <div class="card-head" data-card-id="-2"><div class="name">Add an admin token</div></div>
+      <div class="add-token-body">
+        <input class="guest-label-input" id="admin-label" placeholder="Name (shows in activity)">
+        <input class="guest-label-input" id="admin-email" type="email" placeholder="Alert email (optional)">
+        <button class="add-admin-btn" id="add-admin-btn">Create admin token</button>
+      </div>
     </div>
   </div>
-  <h2>Activity</h2>
-  <table class="activity-summary" id="activity-summary"></table>
-  <select class="activity-filter" id="activity-filter"><option value="">Everyone</option></select>
-  <div id="activity-list"></div>
+  <h2 class="section-head" data-section="activity">Activity<span class="fold">&#9662;</span></h2>
+  <div class="section-body" data-section-body="activity">
+    <table class="activity-summary" id="activity-summary"></table>
+    <select class="activity-filter" id="activity-filter"><option value="">Everyone</option></select>
+    <div id="activity-list"></div>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
 <div class="modal-backdrop" id="modal-backdrop">
@@ -2056,8 +2086,15 @@ function submitPicker() {
   cancelBtn.disabled = true;
 
   var label = document.getElementById('guest-label').value.trim() || 'Guest';
+  var pickerScope = guestScopeParam();
+  if (pickerScope === null) {
+    toast('Pick at least one device');
+    setBusy(setBtn, false);
+    cancelBtn.disabled = false;
+    return;
+  }
   fetch('/api/tokens/create?token=' + encodeURIComponent(TOKEN) +
-        '&label=' + encodeURIComponent(label) + '&until=' + epoch + guestScopeParam(), { method: 'POST' })
+        '&label=' + encodeURIComponent(label) + '&until=' + epoch + pickerScope, { method: 'POST' })
     .then(parseResponse)
     .then(function (result) {
       copyText(guestUrl(result.token));
@@ -2288,24 +2325,23 @@ function render(profiles) {
       return '<button data-id="' + p.id + '" data-minutes="' + m + '">+' + m + 'm</button>';
     }).join('');
     var revokeBtnHtml = '<button class="revoke" data-revoke-id="' + p.id + '">Revoke</button>';
+    var PAUSE_ICON = '<span class="pause-icon"></span>';
     var moveBtns = '<div class="move-btns">' +
       '<button class="move" data-move-id="' + p.id + '" data-dir="up"' + (idx === 0 ? ' disabled' : '') + '>&#9650;</button>' +
       '<button class="move" data-move-id="' + p.id + '" data-dir="down"' + (idx === ordered.length - 1 ? ' disabled' : '') + '>&#9660;</button>' +
       '</div>';
-    var untilRow = '<button class="custom-btn" data-open-reward-picker="' + p.id + '">Custom</button>';
-    var pauseBtns = p.paused
-      ? '<button class="pause-btn resume" data-unpause-id="' + p.id + '">Resume internet</button>'
-      : '<button class="pause-btn" data-pause-id="' + p.id + '" data-pause-minutes="60">Pause 1h</button>' +
-        '<button class="pause-btn" data-open-pause-picker="' + p.id + '">Pause until&hellip;</button>';
+    // Row 2: Custom + Edit schedule (admins); row 3: two pause buttons + Revoke.
+    var untilRow = '<button class="custom-btn' + (isAdmin ? '' : ' wide') + '" data-open-reward-picker="' + p.id + '">Custom</button>' +
+      (isAdmin ? '<button class="sched-btn" data-edit-schedule="' + p.id + '">Edit schedule</button>' : '');
+    var pauseBtns = '<button class="pause-btn" data-pause-id="' + p.id + '" data-pause-minutes="30">' + PAUSE_ICON + ' +30m</button>' +
+      '<button class="pause-btn" data-open-pause-picker="' + p.id + '">' + PAUSE_ICON + ' Until&hellip;</button>';
     var pausedLine = !p.paused ? ''
       : '<div class="paused-line">Paused ' + (p.paused_until ? 'until ' + formatUntil(p.paused_until) : '(no end time)') + '</div>';
     card.innerHTML = '<div class="card-head" data-card-id="' + p.id + '"><div class="name">' + escapeHtml(p.name) + '</div>' + moveBtns + '</div>' +
                       '<div class="remaining" data-remaining="' + p.id + '">' + remainingText + '</div>' + pausedLine +
                       '<div class="schedule">' + scheduleText(p) + '</div>' +
                       '<div class="schedule">' + usageText(p) + '</div>' +
-                      '<div class="btns">' + btns + untilRow + revokeBtnHtml + pauseBtns +
-                      (isAdmin ? '<button class="sched-btn" data-edit-schedule="' + p.id + '">Edit schedule</button>' : '') +
-                      '</div>';
+                      '<div class="btns">' + btns + untilRow + pauseBtns + revokeBtnHtml + '</div>';
     el.appendChild(card);
   });
 }
@@ -2366,10 +2402,10 @@ function renderGuestTokens(tokens) {
            '<div class="expires">until ' + expiresStr + scopeText(t.profile_ids) + '</div></div>' +
            '<div class="guest-row-btns">' +
            '<button class="copy-guest" data-copy-guest="' + t.token + '">Copy</button>' +
-           '<button class="revoke-guest" data-revoke-guest="' + t.token + '">Revoke</button>' +
            '</div></div>' +
            '<div class="guest-row-body"><input class="guest-url-field" readonly ' +
-           'onclick="this.select()" value="' + escapeHtml(guestUrl(t.token)) + '"></div>' +
+           'onclick="this.select()" value="' + escapeHtml(guestUrl(t.token)) + '">' +
+           '<button class="revoke-guest row-revoke" data-revoke-guest="' + t.token + '">Revoke</button></div>' +
            '</div>';
   }).join('');
 }
@@ -2415,13 +2451,14 @@ function renderAdminLinks(admins) {
            '<div class="expires">' + sub + '</div></div>' +
            '<div class="guest-row-btns">' +
            '<button class="copy-guest" data-copy-guest="' + a.token + '">Copy</button>' +
-           (a.is_me ? '' : '<button class="revoke-guest" data-revoke-admin="' + a.token + '">Revoke</button>') +
            '</div></div>' +
            '<div class="guest-row-body"><input class="guest-url-field" readonly ' +
            'onclick="this.select()" value="' + escapeHtml(guestUrl(a.token)) + '">' +
            '<div class="admin-email-row"><input class="guest-url-field" type="email" placeholder="Alert email (optional)" ' +
            'data-admin-email="' + a.token + '" value="' + escapeHtml(email) + '">' +
-           '<button class="copy-guest" data-save-admin-email="' + a.token + '">Save</button></div></div>' +
+           '<button class="copy-guest" data-save-admin-email="' + a.token + '">Save</button></div>' +
+           (a.is_me ? '' : '<button class="revoke-guest row-revoke" data-revoke-admin="' + a.token + '">Revoke</button>') +
+           '</div>' +
            '</div>';
   }).join('');
 }
@@ -2450,22 +2487,33 @@ function scopeText(profileIds) {
 
 // Profile checkboxes on the "Add a token" card - all ticked by default, so a
 // babysitter link covers every profile unless something is unticked.
+// "All devices" (ticked by default) on the "Add a token" card; unticking it
+// lists the devices, in the same order as the cards, to pick from. Kept
+// across the periodic refresh unless reset (after a link is created).
 function renderGuestScope(reset) {
   var el = document.getElementById('guest-scope');
+  var allBox = document.getElementById('scope-all');
+  var all = reset || !allBox || allBox.checked;
   var ticked = {};
-  var boxes = el.querySelectorAll('input[data-scope-id]');
-  Array.prototype.forEach.call(boxes, function (b) { ticked[b.dataset.scopeId] = b.checked; });
-  el.innerHTML = 'Can change:<br>' + lastProfiles.map(function (p) {
-    var on = reset || !(String(p.id) in ticked) || ticked[p.id];
-    return '<label><input type="checkbox" data-scope-id="' + p.id + '"' + (on ? ' checked' : '') + '>' +
-           escapeHtml(p.name) + '</label>';
-  }).join('');
+  if (!reset) {
+    Array.prototype.forEach.call(el.querySelectorAll('input[data-scope-id]'), function (b) {
+      ticked[b.dataset.scopeId] = b.checked;
+    });
+  }
+  el.innerHTML = '<label><input type="checkbox" id="scope-all"' + (all ? ' checked' : '') + '>All devices</label>' +
+    '<div class="scope-list" id="scope-list"' + (all ? ' style="display:none"' : '') + '>' +
+    applyOrder(lastProfiles).map(function (p) {
+      return '<label><input type="checkbox" data-scope-id="' + p.id + '"' + (ticked[p.id] ? ' checked' : '') + '>' +
+             escapeHtml(p.name) + '</label>';
+    }).join('') + '</div>';
 }
 
+// '' for all devices, '&profile_ids=...' for a selection, null if nothing picked.
 function guestScopeParam() {
-  var boxes = Array.prototype.slice.call(document.querySelectorAll('#guest-scope input[data-scope-id]'));
-  var ticked = boxes.filter(function (b) { return b.checked; });
-  if (!boxes.length || ticked.length === boxes.length) return '';
+  if (document.getElementById('scope-all').checked) return '';
+  var ticked = Array.prototype.filter.call(
+    document.querySelectorAll('#guest-scope input[data-scope-id]'), function (b) { return b.checked; });
+  if (!ticked.length) return null;
   return '&profile_ids=' + ticked.map(function (b) { return b.dataset.scopeId; }).join(',');
 }
 
@@ -2546,7 +2594,35 @@ function loadActivity() {
 
 document.addEventListener('change', function (e) {
   if (e.target.id === 'activity-filter') loadActivity();
+  if (e.target.id === 'scope-all') {
+    document.getElementById('scope-list').style.display = e.target.checked ? 'none' : '';
+  }
 });
+
+// Foldable admin sections, remembered per browser like the cards.
+function loadFolded() {
+  try { return JSON.parse(localStorage.getItem('rt_folded_sections') || '[]'); } catch (e) { return []; }
+}
+
+function applyFolded() {
+  var folded = loadFolded();
+  Array.prototype.forEach.call(document.querySelectorAll('.section-head'), function (head) {
+    var isFolded = folded.indexOf(head.dataset.section) !== -1;
+    head.classList.toggle('folded', isFolded);
+    document.querySelector('[data-section-body="' + head.dataset.section + '"]').classList.toggle('folded', isFolded);
+  });
+}
+
+document.addEventListener('click', function (e) {
+  var head = e.target.closest('.section-head');
+  if (!head) return;
+  var folded = loadFolded();
+  var pos = folded.indexOf(head.dataset.section);
+  if (pos === -1) { folded.push(head.dataset.section); } else { folded.splice(pos, 1); }
+  try { localStorage.setItem('rt_folded_sections', JSON.stringify(folded)); } catch (err) {}
+  applyFolded();
+});
+applyFolded();
 
 function loadGuestTokens() {
   fetch('/api/tokens?token=' + encodeURIComponent(TOKEN))
@@ -2725,12 +2801,7 @@ document.addEventListener('click', function (e) {
   var pauseBtn = e.target.closest('button[data-pause-id]');
   if (pauseBtn) {
     sendProfileAction(pauseBtn.dataset.pauseId, '/api/pause',
-                      '&minutes=' + pauseBtn.dataset.pauseMinutes, 'Paused for 1 hour');
-    return;
-  }
-  var unpauseBtn = e.target.closest('button[data-unpause-id]');
-  if (unpauseBtn) {
-    sendProfileAction(unpauseBtn.dataset.unpauseId, '/api/unpause', '', 'Internet resumed');
+                      '&minutes=' + pauseBtn.dataset.pauseMinutes, 'Pause +' + pauseBtn.dataset.pauseMinutes + ' min');
     return;
   }
   var pausePickerBtn = e.target.closest('button[data-open-pause-picker]');
@@ -2770,7 +2841,7 @@ document.addEventListener('click', function (e) {
     fetch('/api/revoke?token=' + encodeURIComponent(TOKEN) +
           '&profile_id=' + revokeId + '&request_id=' + revokeReqId, { method: 'POST' })
       .then(parseResponse)
-      .then(function () { toast('Reward time revoked'); })
+      .then(function () { toast('Back to the normal schedule'); })
       .catch(function (err) { toast(err.message || 'Failed - check connection'); })
       .finally(function () { clearInterval(revokePoll); endBusy(revokeId); });
     return;
@@ -2800,9 +2871,11 @@ document.addEventListener('click', function (e) {
   var durationBtn = e.target.closest('button[data-guest-hours]');
   if (durationBtn) {
     var label = document.getElementById('guest-label').value.trim() || 'Guest';
+    var durationScope = guestScopeParam();
+    if (durationScope === null) { toast('Pick at least one device'); return; }
     setBusy(durationBtn, true);
     fetch('/api/tokens/create?token=' + encodeURIComponent(TOKEN) +
-          '&label=' + encodeURIComponent(label) + '&hours=' + durationBtn.dataset.guestHours + guestScopeParam(),
+          '&label=' + encodeURIComponent(label) + '&hours=' + durationBtn.dataset.guestHours + durationScope,
           { method: 'POST' })
       .then(parseResponse)
       .then(function (result) {
@@ -2872,6 +2945,8 @@ document.addEventListener('click', function (e) {
 
   var revokeGuestBtn = e.target.closest('button[data-revoke-guest]');
   if (revokeGuestBtn) {
+    var guest = lastGuestTokens.filter(function (t) { return t.token === revokeGuestBtn.dataset.revokeGuest; })[0];
+    if (!confirm('Revoke the babysitter link for ' + (guest ? guest.label : 'this person') + '? It stops working immediately.')) return;
     revokeGuestBtn.disabled = true;
     fetch('/api/tokens/revoke?token=' + encodeURIComponent(TOKEN) +
           '&guest_token=' + encodeURIComponent(revokeGuestBtn.dataset.revokeGuest), { method: 'POST' })
@@ -3196,14 +3271,28 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             now = int(time.time())
             previous_expiry = profile_reward_state(profile_id)[1]
             removed = -((previous_expiry - now) // 60) if previous_expiry else 0
+            # Revoke puts the profile back on its normal schedule: reward
+            # time is removed and any pause is ended.
+            paused = profile_pause_state(profile_id)[0]
+            request_id = self._request_id(qs)
             try:
-                revoke_time(profile_id, self._request_id(qs))
+                revoke_time(profile_id, request_id)
             except Exception as exc:
                 log.exception('revoke failed for profile_id=%s', profile_id)
                 record_activity(actor, 'revoke', profile_id, minutes=removed, ok=False, detail=str(exc))
                 self._send_json({'error': str(exc)}, status=500)
                 return
             record_activity(actor, 'revoke', profile_id, minutes=removed)
+            if paused:
+                try:
+                    unpause_profile(profile_id, request_id + '_unpause')
+                except Exception as exc:
+                    log.exception('unpause after revoke failed for profile_id=%s', profile_id)
+                    record_activity(actor, 'unpause', profile_id, ok=False, detail=str(exc))
+                    self._send_json({'error': 'Reward time removed, but the pause could not be ended: %s' % exc},
+                                    status=500)
+                    return
+                record_activity(actor, 'unpause', profile_id)
             self._send_json({'ok': True})
             return
 
@@ -3253,10 +3342,16 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             now = int(time.time())
             action = parsed.path[len('/api/'):]
             until = None
+            added_minutes = None
             if action == 'pause':
                 try:
                     if 'minutes' in qs:
-                        until = now + int(qs['minutes'][0]) * 60
+                        # Repeated presses extend: added to a timed pause's
+                        # current end, otherwise counted from now.
+                        paused, timed_until = profile_pause_state(profile_id)
+                        start = timed_until if (paused and timed_until and timed_until > now) else now
+                        until = start + int(qs['minutes'][0]) * 60
+                        added_minutes = int(qs['minutes'][0])
                     else:
                         until = int(qs['until'][0])
                 except (KeyError, ValueError):
@@ -3265,7 +3360,10 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if until <= now or until > now + 32 * 24 * 3600:
                     self._send_json({'error': 'Pick a time within one month from now'}, status=400)
                     return
-            minutes = (until - now) // 60 if until else None
+            # Logged as the time this press added (a repeat press adds to the end).
+            minutes = None
+            if until:
+                minutes = added_minutes if 'minutes' in qs else (until - now) // 60
             try:
                 if action == 'pause':
                     pause_profile(profile_id, until, self._request_id(qs))
