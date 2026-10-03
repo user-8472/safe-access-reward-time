@@ -297,11 +297,11 @@ def weekly_data(now):
     sa = sqlite3.connect(CONFIG['db_path'], timeout=10)
     try:
         usage = sa.execute(
-            "SELECT profile.name, SUM(t.normal_spent) + SUM(t.reward_spent), SUM(t.reward_spent) "
+            "SELECT profile.id, profile.name, SUM(t.normal_spent) + SUM(t.reward_spent), SUM(t.reward_spent) "
             "FROM profile JOIN config_group ON config_group.profile_id = profile.id "
             "LEFT JOIN config_group_hour_timespent t ON t.parent_id = config_group.id AND t.timestamp >= ? "
             "WHERE profile.visible = 1 AND profile.enable_blocktime = 1 AND profile.name NOT LIKE '$%' "
-            "GROUP BY profile.id ORDER BY 2 DESC, profile.name", (since,)).fetchall()
+            "GROUP BY profile.id ORDER BY profile.name", (since,)).fetchall()
     finally:
         sa.close()
     conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
@@ -316,8 +316,25 @@ def weekly_data(now):
     finally:
         conn.close()
     period = '%s - %s' % (time.strftime('%b %d', time.localtime(since)), time.strftime('%b %d', time.localtime(now)))
-    return period, [(n, t or 0, r or 0) for n, t, r in usage], \
+    return period, [(i, n, t or 0, r or 0) for i, n, t, r in usage], \
         [(a, k, g or 0, m or 0, rv or 0, pz or 0, sc or 0, f or 0) for a, k, g, m, rv, pz, sc, f in people]
+
+
+def card_order(token):
+    # The recipient's card order from the app (profile ids), else the most
+    # recently saved one, so the email lists devices the way their app does.
+    try:
+        conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
+        try:
+            row = conn.execute("SELECT card_order FROM admin_tokens WHERE token = ? AND card_order IS NOT NULL",
+                               (token,)).fetchone() if token else None
+            row = row or conn.execute("SELECT card_order FROM admin_tokens WHERE card_order IS NOT NULL "
+                                      "ORDER BY order_updated DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        return json.loads(row[0]) if row else []
+    except (sqlite3.Error, ValueError):
+        return []
 
 
 def admin_link(token=None):
@@ -331,6 +348,9 @@ def admin_link(token=None):
 def weekly_report(now, token=None):
     # (subject, plain text, html) for the 7 days up to now.
     period, usage, people = weekly_data(now)
+    order = card_order(token)
+    usage.sort(key=lambda u: (order.index(u[0]) if u[0] in order else len(order), u[1]))
+    usage = [(name, total, reward) for _, name, total, reward in usage]
     subject = 'Reward Time weekly summary: %s' % period
     link = admin_link(token)
 
@@ -352,7 +372,9 @@ def weekly_report(now, token=None):
                 text.append('    %s: %d' % (label, count))
     text += ['', 'Manage alerts and this weekly email under Admin Access:', link or '(open the app)']
 
-    cell = 'padding:6px 10px;border-bottom:1px solid #e5e5ea;'
+    # nowrap: on a narrow phone screen the tables scroll or zoom instead of
+    # squeezing text onto several lines.
+    cell = 'padding:6px 10px;border-bottom:1px solid #e5e5ea;white-space:nowrap;'
     head = cell + 'text-align:left;color:#6e6e73;font-weight:600;'
     rows_usage = ''.join(
         '<tr><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td></tr>' % (
@@ -368,23 +390,27 @@ def weekly_report(now, token=None):
             cell + ('color:#ff3b30;font-weight:600;' if failed else ''), failed or '&ndash;')
         for actor, kind, grants, minutes, revokes, pauses, schedules, failed in people) or \
         '<tr><td style="%s" colspan="6">Nothing this week.</td></tr>' % cell
-    button = ('<p style="margin:28px 0 8px"><a href="%s" style="background:#0a84ff;color:#fff;padding:12px 18px;'
-              'border-radius:10px;text-decoration:none;font-weight:600">Open Admin Access</a></p>'
+    # A one-cell table rather than a padded inline link: Gmail doesn't make
+    # room for an inline link's padding, so it overlapped the next line.
+    button = ('<table cellpadding="0" cellspacing="0" style="margin:28px 0 12px"><tr>'
+              '<td style="background:#0a84ff;border-radius:10px">'
+              '<a href="%s" style="display:block;padding:12px 18px;color:#ffffff;text-decoration:none;'
+              'font-weight:600;white-space:nowrap">Open Admin Access</a></td></tr></table>'
               '<p style="color:#6e6e73;font-size:13px;margin:0">Opens the Reward Time app (the installed app on '
               'your phone) to change alert emails or turn this weekly email off.</p>' % html_escape(link)) \
         if link else '<p style="color:#6e6e73">Turn this off under Admin Access in the app.</p>'
     html = (
-        '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1c1c1e;max-width:600px">'
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1c1c1e">'
         '<h2 style="margin:0 0 4px">Reward Time</h2>'
         '<div style="color:#6e6e73;margin-bottom:20px">Week of %s</div>'
         '<h3 style="margin:0 0 6px">Internet use</h3>'
-        '<table style="border-collapse:collapse;width:100%%;font-size:14px">'
+        '<table style="border-collapse:collapse;font-size:14px">'
         '<tr><th style="%s">Kid / device</th><th style="%s">Total</th><th style="%s">Reward</th>'
         '<th style="%s">Per day</th></tr>%s</table>'
         '<h3 style="margin:24px 0 6px">Activity</h3>'
-        '<table style="border-collapse:collapse;width:100%%;font-size:14px">'
-        '<tr><th style="%s">Who</th><th style="%s">Reward grants</th><th style="%s">Revokes</th>'
-        '<th style="%s">Pauses</th><th style="%s">Schedule changes</th><th style="%s">Failed</th></tr>%s</table>'
+        '<table style="border-collapse:collapse;font-size:14px">'
+        '<tr><th style="%s">Who</th><th style="%s">Grants</th><th style="%s">Revokes</th>'
+        '<th style="%s">Pauses</th><th style="%s">Schedules</th><th style="%s">Failed</th></tr>%s</table>'
         '%s</div>' % (html_escape(period), head, head, head, head, rows_usage,
                       head, head, head, head, head, head, rows_people, button))
     return subject, '\n'.join(text), html

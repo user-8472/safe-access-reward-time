@@ -93,6 +93,11 @@ def get_tokens_db():
     admin_columns = [row[1] for row in conn.execute("PRAGMA table_info(admin_tokens)")]
     if 'weekly' not in admin_columns:
         conn.execute("ALTER TABLE admin_tokens ADD COLUMN weekly INTEGER NOT NULL DEFAULT 0")
+    # Card order (JSON list of profile ids), per admin, so it matches on every
+    # device they use; order_updated picks the fallback for everyone else.
+    if 'card_order' not in admin_columns:
+        conn.execute("ALTER TABLE admin_tokens ADD COLUMN card_order TEXT")
+        conn.execute("ALTER TABLE admin_tokens ADD COLUMN order_updated INTEGER")
     guest_columns = [row[1] for row in conn.execute("PRAGMA table_info(guest_tokens)")]
     if 'profile_ids' not in guest_columns:
         conn.execute("ALTER TABLE guest_tokens ADD COLUMN profile_ids TEXT")
@@ -169,6 +174,32 @@ def set_admin_email(token, email):
         conn.close()
 
 
+def get_card_order(token):
+    # (order, is_own): this admin's saved order, else the most recently saved
+    # by any admin (babysitters, and admins who never reordered), else None.
+    conn = get_tokens_db()
+    try:
+        own = conn.execute("SELECT card_order FROM admin_tokens WHERE token = ?", (token,)).fetchone()
+        if own and own[0]:
+            return json.loads(own[0]), True
+        latest = conn.execute(
+            "SELECT card_order FROM admin_tokens WHERE card_order IS NOT NULL "
+            "ORDER BY order_updated DESC LIMIT 1").fetchone()
+        return (json.loads(latest[0]) if latest else None), False
+    finally:
+        conn.close()
+
+
+def set_card_order(token, ids):
+    conn = get_tokens_db()
+    try:
+        conn.execute("UPDATE admin_tokens SET card_order = ?, order_updated = ? WHERE token = ?",
+                     (json.dumps(ids), int(time.time()), token))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def set_admin_weekly(token, weekly):
     conn = get_tokens_db()
     try:
@@ -200,8 +231,8 @@ def get_version():
         parts.append(conn.execute("SELECT MAX(id) FROM activity").fetchone())
         parts.append(conn.execute("SELECT COUNT(*), MAX(created_at), MAX(expires_at) FROM guest_tokens").fetchone())
         parts.append(conn.execute(
-            "SELECT COUNT(*), GROUP_CONCAT(label || ':' || IFNULL(email, '') || ':' || weekly) "
-            "FROM admin_tokens").fetchone())
+            "SELECT COUNT(*), GROUP_CONCAT(label || ':' || IFNULL(email, '') || ':' || weekly || ':' || "
+            "IFNULL(card_order, '')) FROM admin_tokens").fetchone())
     finally:
         conn.close()
     sa = get_db()
@@ -2460,6 +2491,13 @@ function saveOrder(ids) {
   try { localStorage.setItem('rt_order', JSON.stringify(ids)); } catch (e) {}
 }
 
+function saveServerOrder(ids) {
+  if (!isAdmin) return;
+  fetch('/api/order?token=' + encodeURIComponent(TOKEN) + '&ids=' + ids.join(','), { method: 'POST' })
+    .then(function () { resetVersionBaseline(); })
+    .catch(function () {});
+}
+
 function loadExpanded() {
   try { return JSON.parse(localStorage.getItem('rt_expanded') || '[]'); } catch (e) { return []; }
 }
@@ -2573,6 +2611,14 @@ function loadProfiles() {
       // overwrite the screen with stale data.
       if (seq !== loadProfilesSeq) return;
       isAdmin = data.is_admin;
+      // The server keeps each admin's card order, so it matches on every
+      // device. An admin with no saved order yet uploads this browser's (the
+      // order used to live only in each browser).
+      if (isAdmin && !data.order_is_own && loadOrder().length) {
+        saveServerOrder(loadOrder());
+      } else if (data.order) {
+        saveOrder(data.order);
+      }
       render(data.profiles);
       var section = document.getElementById('admin-section');
       section.style.display = isAdmin ? 'block' : 'none';
@@ -3106,6 +3152,7 @@ document.addEventListener('click', function (e) {
       ids[idx] = ids[swapWith];
       ids[swapWith] = tmp;
       saveOrder(ids);
+      saveServerOrder(ids);
       render(lastProfiles);
     }
     return;
@@ -3511,7 +3558,9 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             actor = get_actor(self._supplied_token(qs))
             admin = get_admin(self._supplied_token(qs))
             profiles = [p for p in get_profiles() if can_change(actor, p['id'])]
-            status = {'profiles': profiles, 'is_admin': admin is not None}
+            order, order_is_own = get_card_order(self._supplied_token(qs))
+            status = {'profiles': profiles, 'is_admin': admin is not None,
+                      'order': order, 'order_is_own': order_is_own}
             if admin:
                 status['me'] = admin['label']
                 status['health'] = get_health()
@@ -3675,6 +3724,23 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send_json({'error': str(exc)}, status=500)
                 return
             record_activity(actor, 'schedule_set', profile_id, detail=detail)
+            self._send_json({'ok': True})
+            return
+
+        if parsed.path == '/api/order':
+            me = self._supplied_token(qs)
+            if not is_admin_token(me):
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            try:
+                ids = [int(x) for x in qs.get('ids', [''])[0].split(',') if x]
+            except ValueError:
+                self._send_json({'error': 'bad request'}, status=400)
+                return
+            if not ids or len(ids) > 200:
+                self._send_json({'error': 'bad request'}, status=400)
+                return
+            set_card_order(me, ids)
             self._send_json({'ok': True})
             return
 

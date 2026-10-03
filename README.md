@@ -65,7 +65,9 @@ this app avoids it.
 
 - **A card per restricted profile or device** showing active reward time, today's schedule window
   ("Scheduled on now: 6:00 AM - 9:00 PM", or the next one) and today's usage, including how much was
-  reward time. Cards collapse and reorder with tap arrows, remembered per browser.
+  reward time. Reorder cards with the arrows: each admin's order is saved on the server, so it
+  matches on all their devices (and orders their weekly email). Which cards are expanded is
+  remembered per browser.
 - **Reward time:** +5m/+15m/+30m/+60m buttons that stack, and **Custom** for an exact date and time.
 - **Pause internet:** **+30m** pauses (tap again to extend), **Until...** pauses to a set time.
   **Resume** ends a pause, and **Revoke** puts the profile back on its normal schedule (removes
@@ -307,7 +309,8 @@ alert email, tick **Weekly usage email (Sundays)**, or revoke it. You can't revo
 or the last one. A warning banner appears at the top of the page if the health monitor sees a
 problem.
 
-The weekly email lists each kid's or device's internet use, then each person's activity. Its
+The weekly email lists each kid's or device's internet use (in the recipient's card order), then
+each person's activity. Its
 **Open Admin Access** button carries no access token: on a phone with the app installed, it opens
 in the app, which remembers its own link on that device, and goes straight to your row in Admin
 Access, flashing the email settings. On other devices it just asks you to use your own link. The
