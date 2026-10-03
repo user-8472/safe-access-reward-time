@@ -2514,6 +2514,7 @@ function loadProfiles() {
       var section = document.getElementById('admin-section');
       section.style.display = isAdmin ? 'block' : 'none';
       renderHealth(isAdmin ? data.health : []);
+      if (isAdmin) jumpToHashSection();
       if (isAdmin) { loadAdminLinks(); loadActivity(); renderGuestScope(false); }
       if (isAdmin) {
         renderDurationButtons();
@@ -2761,6 +2762,28 @@ document.addEventListener('change', function (e) {
     document.getElementById('scope-list').style.display = e.target.checked ? 'none' : '';
   }
 });
+
+// A link ending in #admin-access (e.g. from the weekly email) opens that
+// section - unfolded if needed - once the admin sections have loaded.
+var jumpedToHash = false;
+function jumpToHashSection() {
+  if (jumpedToHash || location.hash !== '#admin-access') return;
+  jumpedToHash = true;
+  var folded = loadFolded();
+  var pos = folded.indexOf('admin');
+  if (pos !== -1) {
+    folded.splice(pos, 1);
+    try { localStorage.setItem('rt_folded_sections', JSON.stringify(folded)); } catch (err) {}
+    applyFolded();
+  }
+  setTimeout(function () {
+    var head = document.querySelector('.section-head[data-section="admin"]');
+    if (!head) return;
+    // Land just below the sticky title bar, which would otherwise cover it.
+    var bar = document.querySelector('h1').offsetHeight;
+    window.scrollTo({ top: head.getBoundingClientRect().top + window.pageYOffset - bar - 8, behavior: 'smooth' });
+  }, 600);
+}
 
 // Foldable admin sections, remembered per browser like the cards.
 function loadFolded() {

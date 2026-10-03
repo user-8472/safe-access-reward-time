@@ -307,6 +307,11 @@ alert email, tick **Weekly usage email (Sundays)**, or revoke it. You can't revo
 or the last one. A warning banner appears at the top of the page if the health monitor sees a
 problem.
 
+The weekly email lists each kid's or device's internet use, then each person's activity. Its
+**Open Admin Access** button opens the app (the installed app, on a phone) on the recipient's own
+link at Admin Access, to change or turn off emails. It uses `public_url` in `config.json`, which
+the installer sets from your DDNS hostname and port.
+
 ### Activity
 
 A per-person table of the last 7 and 30 days (actions and minutes granted, revokes, pauses), and the

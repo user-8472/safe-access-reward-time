@@ -109,6 +109,7 @@ cat > config.json << EOF
   "token": "$TOKEN",
   "admin_label": "$ADMIN_LABEL",
   "root_dir": "$ROOT_DIR",
+  "public_url": "https://${DDNS_HOSTNAME:-$(hostname)}:$HTTPS_PORT",
   "port": $HTTPS_PORT,
   "cert_file": "$APP_DIR/cert/fullchain.pem",
   "key_file": "$APP_DIR/cert/privkey.pem"

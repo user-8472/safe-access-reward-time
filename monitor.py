@@ -32,7 +32,12 @@ import ssl
 import subprocess
 import sys
 import time
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+try:
+    from html import escape as html_escape
+except ImportError:  # Python 2
+    from cgi import escape as html_escape
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(APP_DIR, 'monitor.state')
@@ -200,6 +205,21 @@ def run_checks(state):
     return problems, events
 
 
+def weekly_recipients():
+    # [(email, admin token)] for admin links that ticked the weekly email;
+    # each gets their own copy, since the link at the bottom is personal.
+    try:
+        conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
+        try:
+            return conn.execute(
+                "SELECT email, token FROM admin_tokens WHERE weekly = 1 "
+                "AND email IS NOT NULL AND email != '' ORDER BY created_at").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+
+
 def alert_recipients(weekly=False):
     # Admin links with an alert email (managed on the app's admin page); for
     # the weekly summary, only those that also ticked "Weekly usage email".
@@ -237,13 +257,18 @@ def send_email(recipients, alerts):
     return send_mail(recipients, subject, body)
 
 
-def send_mail(recipients, subject, body):
+def send_mail(recipients, subject, body, html=None):
     # config.json "smtp": {"host": "smtp.gmail.com", "port": 465,
     #                      "user": "...", "password": "<app password>"}
     smtp = CONFIG.get('smtp')
     if not smtp or not recipients:
         return False
-    msg = MIMEText(body + '\n')
+    if html:
+        msg = MIMEMultipart('alternative')
+        msg.attach(MIMEText(body + '\n', 'plain', 'utf-8'))
+        msg.attach(MIMEText(html, 'html', 'utf-8'))
+    else:
+        msg = MIMEText(body + '\n')
     msg['Subject'] = subject
     msg['From'] = smtp.get('from', smtp['user'])
     msg['To'] = ', '.join(recipients)
@@ -266,12 +291,19 @@ def minutes_text(m):
     return ' '.join(parts)
 
 
-def weekly_report(now):
-    # (subject, body) for the 7 days up to now: who did what, and usage.
+def weekly_data(now):
+    # The week's numbers: per-profile internet use, then per-person activity.
     since = now - 7 * 86400
-    period = '%s - %s' % (time.strftime('%b %d', time.localtime(since)), time.strftime('%b %d', time.localtime(now)))
-    lines = ['Reward Time, week of %s' % period, '']
-
+    sa = sqlite3.connect(CONFIG['db_path'], timeout=10)
+    try:
+        usage = sa.execute(
+            "SELECT profile.name, SUM(t.normal_spent) + SUM(t.reward_spent), SUM(t.reward_spent) "
+            "FROM profile JOIN config_group ON config_group.profile_id = profile.id "
+            "LEFT JOIN config_group_hour_timespent t ON t.parent_id = config_group.id AND t.timestamp >= ? "
+            "WHERE profile.visible = 1 AND profile.enable_blocktime = 1 AND profile.name NOT LIKE '$%' "
+            "GROUP BY profile.id ORDER BY 2 DESC, profile.name", (since,)).fetchall()
+    finally:
+        sa.close()
     conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
     try:
         people = conn.execute(
@@ -283,40 +315,77 @@ def weekly_report(now):
             "FROM activity WHERE ts >= ? GROUP BY actor ORDER BY actor", (since,)).fetchall()
     finally:
         conn.close()
-    lines.append('Who did what')
-    if not people:
-        lines.append('  Nothing this week.')
-    for actor, kind, grants, minutes, revokes, pauses, schedules, failed in people:
-        parts = []
-        if grants:
-            parts.append('%d reward grant%s, %s' % (grants, '' if grants == 1 else 's', minutes_text(minutes)))
-        if revokes:
-            parts.append('%d revoke%s' % (revokes, '' if revokes == 1 else 's'))
-        if pauses:
-            parts.append('%d pause%s' % (pauses, '' if pauses == 1 else 's'))
-        if schedules:
-            parts.append('%d schedule change%s' % (schedules, '' if schedules == 1 else 's'))
-        if failed:
-            parts.append('%d FAILED' % failed)
-        lines.append('  %s%s: %s' % (actor, ' (babysitter)' if kind == 'guest' else '',
-                                     '; '.join(parts) or 'link changes only'))
+    period = '%s - %s' % (time.strftime('%b %d', time.localtime(since)), time.strftime('%b %d', time.localtime(now)))
+    return period, [(n, t or 0, r or 0) for n, t, r in usage], \
+        [(a, k, g or 0, m or 0, rv or 0, pz or 0, sc or 0, f or 0) for a, k, g, m, rv, pz, sc, f in people]
 
-    sa = sqlite3.connect(CONFIG['db_path'], timeout=10)
-    try:
-        usage = sa.execute(
-            "SELECT profile.name, SUM(t.normal_spent) + SUM(t.reward_spent), SUM(t.reward_spent) "
-            "FROM profile JOIN config_group ON config_group.profile_id = profile.id "
-            "LEFT JOIN config_group_hour_timespent t ON t.parent_id = config_group.id AND t.timestamp >= ? "
-            "WHERE profile.visible = 1 AND profile.enable_blocktime = 1 AND profile.name NOT LIKE '$%' "
-            "GROUP BY profile.id ORDER BY profile.name", (since,)).fetchall()
-    finally:
-        sa.close()
-    lines += ['', 'Internet use (total, of which reward time)']
+
+def admin_link(token):
+    # Opens the app (or the installed web app on a phone) at Admin Access.
+    base = CONFIG.get('public_url', '').rstrip('/')
+    return '%s/?token=%s#admin-access' % (base, token) if base and token else None
+
+
+def weekly_report(now, token=None):
+    # (subject, plain text, html) for the 7 days up to now.
+    period, usage, people = weekly_data(now)
+    subject = 'Reward Time weekly summary: %s' % period
+    link = admin_link(token)
+
+    text = ['REWARD TIME - WEEK OF %s' % period.upper(), '', 'INTERNET USE', '-' * 12]
     for name, total, reward in usage:
-        lines.append('  %s: %s%s' % (name, minutes_text(total or 0),
-                                     ', %s reward' % minutes_text(reward) if reward else ''))
-    lines += ['', 'Sent by the Reward Time app. Turn this off under Admin Access on the app page.']
-    return 'Reward Time weekly summary: %s' % period, '\n'.join(lines)
+        text.append('  %-22s %-16s%s' % (name, minutes_text(total),
+                                         'reward %s' % minutes_text(reward) if reward else ''))
+    text += ['', 'ACTIVITY', '-' * 8]
+    if not people:
+        text.append('  Nothing this week.')
+    for actor, kind, grants, minutes, revokes, pauses, schedules, failed in people:
+        who = actor + (' (babysitter)' if kind == 'guest' else '')
+        text.append('  %s' % who)
+        if grants:
+            text.append('    Reward time: %d grant%s, %s' % (grants, '' if grants == 1 else 's', minutes_text(minutes)))
+        for count, label in ((revokes, 'Revokes'), (pauses, 'Pauses'), (schedules, 'Schedule changes'),
+                             (failed, 'FAILED actions')):
+            if count:
+                text.append('    %s: %d' % (label, count))
+    text += ['', 'Manage alerts and this weekly email under Admin Access:', link or '(open the app)']
+
+    cell = 'padding:6px 10px;border-bottom:1px solid #e5e5ea;'
+    head = cell + 'text-align:left;color:#6e6e73;font-weight:600;'
+    rows_usage = ''.join(
+        '<tr><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td></tr>' % (
+            cell, html_escape(name), cell, minutes_text(total), cell,
+            minutes_text(reward) if reward else '&ndash;', cell, minutes_text(total // 7))
+        for name, total, reward in usage)
+    rows_people = ''.join(
+        '<tr><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td>'
+        '<td style="%s">%s</td><td style="%s">%s</td></tr>' % (
+            cell, html_escape(actor) + (' <span style="color:#6e6e73">(babysitter)</span>' if kind == 'guest' else ''),
+            cell, ('%d &middot; %s' % (grants, minutes_text(minutes))) if grants else '&ndash;',
+            cell, revokes or '&ndash;', cell, pauses or '&ndash;', cell, schedules or '&ndash;',
+            cell + ('color:#ff3b30;font-weight:600;' if failed else ''), failed or '&ndash;')
+        for actor, kind, grants, minutes, revokes, pauses, schedules, failed in people) or \
+        '<tr><td style="%s" colspan="6">Nothing this week.</td></tr>' % cell
+    button = ('<p style="margin:28px 0 8px"><a href="%s" style="background:#0a84ff;color:#fff;padding:12px 18px;'
+              'border-radius:10px;text-decoration:none;font-weight:600">Open Admin Access</a></p>'
+              '<p style="color:#6e6e73;font-size:13px;margin:0">Opens the Reward Time app (the installed app on '
+              'your phone) to change alert emails or turn this weekly email off.</p>' % html_escape(link)) \
+        if link else '<p style="color:#6e6e73">Turn this off under Admin Access in the app.</p>'
+    html = (
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1c1c1e;max-width:600px">'
+        '<h2 style="margin:0 0 4px">Reward Time</h2>'
+        '<div style="color:#6e6e73;margin-bottom:20px">Week of %s</div>'
+        '<h3 style="margin:0 0 6px">Internet use</h3>'
+        '<table style="border-collapse:collapse;width:100%%;font-size:14px">'
+        '<tr><th style="%s">Kid / device</th><th style="%s">Total</th><th style="%s">Reward</th>'
+        '<th style="%s">Per day</th></tr>%s</table>'
+        '<h3 style="margin:24px 0 6px">Activity</h3>'
+        '<table style="border-collapse:collapse;width:100%%;font-size:14px">'
+        '<tr><th style="%s">Who</th><th style="%s">Reward grants</th><th style="%s">Revokes</th>'
+        '<th style="%s">Pauses</th><th style="%s">Schedule changes</th><th style="%s">Failed</th></tr>%s</table>'
+        '%s</div>' % (html_escape(period), head, head, head, head, rows_usage,
+                      head, head, head, head, head, head, rows_people, button))
+    return subject, '\n'.join(text), html
 
 
 def maybe_send_weekly(state, now):
@@ -324,14 +393,19 @@ def maybe_send_weekly(state, now):
     week = time.strftime('%Y-%W', lt)
     if lt.tm_wday != WEEKLY_WEEKDAY or lt.tm_hour < WEEKLY_HOUR or state.get('weekly_sent') == week:
         return
-    recipients = alert_recipients(weekly=True)
-    if recipients:
+    sent = state.setdefault('weekly_sent_to', {})
+    if sent.get('week') != week:
+        sent.clear()
+        sent['week'] = week
+    for email, token in weekly_recipients():
+        if sent.get(email):
+            continue  # already got this week's copy (an earlier run failed part-way)
         try:
-            subject, body = weekly_report(now)
-            send_mail(recipients, subject, body)
-            log.info('weekly summary sent to %s', ', '.join(recipients))
+            send_mail([email], *weekly_report(now, token))
+            sent[email] = True
+            log.info('weekly summary sent to %s', email)
         except Exception as exc:
-            log.info('could not send weekly summary (will retry): %s', exc)
+            log.info('could not send weekly summary to %s (will retry): %s', email, exc)
             return
     state['weekly_sent'] = week
 
@@ -384,13 +458,15 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['--test-email']:
         sys.exit(test_email())
     if sys.argv[1:] == ['--weekly-preview']:
-        print('\n\n'.join(weekly_report(int(time.time()))))
+        subject, text, html = weekly_report(int(time.time()))
+        print(subject + '\n\n' + text)
         sys.exit(0)
     if sys.argv[1:] == ['--weekly-now']:
-        recipients = alert_recipients(weekly=True)
+        recipients = weekly_recipients()
         if not recipients:
             sys.exit('No admin link has both an alert email and "Weekly usage email" ticked.')
-        send_mail(recipients, *weekly_report(int(time.time())))
-        print('Sent the weekly summary to: %s' % ', '.join(recipients))
+        for email, token in recipients:
+            send_mail([email], *weekly_report(int(time.time()), token))
+            print('Sent the weekly summary to: %s' % email)
         sys.exit(0)
     main()
