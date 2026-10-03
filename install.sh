@@ -95,6 +95,10 @@ openssl req -x509 -newkey rsa:2048 -keyout cert/privkey.pem -out cert/fullchain.
   -days 3650 -nodes -config "$CERT_CONF" >/dev/null 2>&1
 rm -f "$CERT_CONF"
 
+printf "Your name, for the first admin link (shows in activity) [Admin]: "
+read ADMIN_LABEL
+ADMIN_LABEL=${ADMIN_LABEL:-Admin}
+
 printf "Safe Access database path [%s]: " "$DEFAULT_DB_PATH"
 read DB_PATH
 DB_PATH=${DB_PATH:-$DEFAULT_DB_PATH}
@@ -103,6 +107,8 @@ cat > config.json << EOF
 {
   "db_path": "$DB_PATH",
   "token": "$TOKEN",
+  "admin_label": "$ADMIN_LABEL",
+  "root_dir": "$ROOT_DIR",
   "port": $HTTPS_PORT,
   "cert_file": "$APP_DIR/cert/fullchain.pem",
   "key_file": "$APP_DIR/cert/privkey.pem"
@@ -110,7 +116,7 @@ cat > config.json << EOF
 EOF
 
 echo "Filling in scripts with your settings..."
-for f in watchdog.sh root/apply_daemon.py root/apply_watchdog.sh root/app_watchdog.sh \
+for f in watchdog.sh root/apply_daemon.py root/apply_watchdog.sh root/app_watchdog.sh root/monitor_launcher.sh \
          root/reward-time-rcd.sh root/reward-apply-rcd.sh root/cert-sync.sh; do
   sed -i \
     -e "s|__APP_USER__|$APP_USER|g" \
@@ -120,7 +126,7 @@ for f in watchdog.sh root/apply_daemon.py root/apply_watchdog.sh root/app_watchd
     -e "s|PORT=__HTTPS_PORT__|PORT=$HTTPS_PORT|g" \
     "$f"
 done
-chmod +x watchdog.sh reward_server.py
+chmod +x watchdog.sh reward_server.py monitor.py
 chmod 600 cert/privkey.pem config.json
 mkdir -p pending
 
@@ -136,8 +142,8 @@ cat << EOF
 #    root never runs anything from $APP_DIR itself, since you (the app
 #    user) can write there:
 mkdir -m 755 $ROOT_DIR
-cp $APP_DIR/root/apply_daemon.py $APP_DIR/root/apply_watchdog.sh \\
-   $APP_DIR/root/app_watchdog.sh $APP_DIR/root/cert-sync.sh $ROOT_DIR/
+cp $APP_DIR/root/apply_daemon.py $APP_DIR/root/apply_watchdog.sh $APP_DIR/root/app_watchdog.sh \\
+   $APP_DIR/root/monitor_launcher.sh $APP_DIR/root/cert-sync.sh $ROOT_DIR/
 chown -R root:root $ROOT_DIR
 chmod 755 $ROOT_DIR/*
 
@@ -157,6 +163,7 @@ chmod 755 /usr/local/etc/rc.d/reward-time.sh /usr/local/etc/rc.d/reward-apply.sh
 #    $APP_USER before running anything from $APP_DIR.
 printf '*/1\t*\t*\t*\t*\troot\t$ROOT_DIR/app_watchdog.sh\n' >> /etc/crontab
 printf '*/1\t*\t*\t*\t*\troot\t$ROOT_DIR/apply_watchdog.sh\n' >> /etc/crontab
+printf '*/1\t*\t*\t*\t*\troot\t$ROOT_DIR/monitor_launcher.sh\n' >> /etc/crontab
 /usr/syno/sbin/synoservicectl --restart crond
 
 # 4) Verify it's running:

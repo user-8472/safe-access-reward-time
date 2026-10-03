@@ -51,6 +51,10 @@ DURATION_PRESETS_HOURS = [4, 8, 24, 48, 72]
 TOKENS_DB_PATH = os.path.join(APP_DIR, 'tokens.db')
 
 
+MONITOR_STATE_PATH = os.path.join(APP_DIR, 'monitor.state')
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+
 def get_tokens_db():
     conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
     conn.execute(
@@ -58,11 +62,103 @@ def get_tokens_db():
         "token TEXT PRIMARY KEY, label TEXT NOT NULL, "
         "created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)"
     )
+    # Admin links, each with a name (so activity can say who did what) and an
+    # optional email that monitor.py sends alerts to. The token in config.json
+    # only seeds the first row; from then on this table is the source of truth,
+    # so revoking that original link really revokes it.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS admin_tokens ("
+        "token TEXT PRIMARY KEY, label TEXT NOT NULL, email TEXT, "
+        "created_at INTEGER NOT NULL)"
+    )
+    if conn.execute("SELECT COUNT(*) FROM admin_tokens").fetchone()[0] == 0:
+        conn.execute(
+            "INSERT INTO admin_tokens (token, label, email, created_at) VALUES (?, ?, NULL, ?)",
+            (TOKEN, CONFIG.get('admin_label', 'Admin'), int(time.time()))
+        )
+        conn.commit()
     return conn
 
 
+def get_admin(supplied):
+    # Returns {'label', 'email'} for a valid admin token, else None.
+    if not supplied:
+        return None
+    conn = get_tokens_db()
+    try:
+        row = conn.execute(
+            "SELECT token, label, email FROM admin_tokens WHERE token = ?", (supplied,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or not hmac.compare_digest(str(row[0]), str(supplied)):
+        return None
+    return {'label': row[1], 'email': row[2]}
+
+
 def is_admin_token(supplied):
-    return len(supplied) == len(TOKEN) and hmac.compare_digest(supplied, TOKEN)
+    return get_admin(supplied) is not None
+
+
+def list_admin_tokens():
+    conn = get_tokens_db()
+    try:
+        rows = conn.execute(
+            "SELECT token, label, email FROM admin_tokens ORDER BY created_at"
+        ).fetchall()
+        return [{'token': t, 'label': label, 'email': email or ''} for t, label, email in rows]
+    finally:
+        conn.close()
+
+
+def create_admin_token(label, email):
+    token = binascii.hexlify(os.urandom(24))
+    conn = get_tokens_db()
+    try:
+        conn.execute(
+            "INSERT INTO admin_tokens (token, label, email, created_at) VALUES (?, ?, ?, ?)",
+            (token, label, email or None, int(time.time()))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return token
+
+
+def set_admin_email(token, email):
+    conn = get_tokens_db()
+    try:
+        conn.execute("UPDATE admin_tokens SET email = ? WHERE token = ?", (email or None, token))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def revoke_admin_token(token):
+    # Never leaves zero admin links - that would lock everyone out.
+    conn = get_tokens_db()
+    try:
+        if conn.execute("SELECT COUNT(*) FROM admin_tokens").fetchone()[0] <= 1:
+            raise ValueError("Can't revoke the last admin link")
+        conn.execute("DELETE FROM admin_tokens WHERE token = ?", (token,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_health():
+    # Problems monitor.py currently sees, for the admin warning banner. A stale
+    # state file means the monitor itself isn't running.
+    try:
+        age = time.time() - os.stat(MONITOR_STATE_PATH).st_mtime
+        with open(MONITOR_STATE_PATH) as f:
+            state = json.load(f)
+    except (OSError, IOError, ValueError):
+        return ['Health monitor has not run yet']
+    problems = ['%s: %s' % (name, text) for name, text in sorted(state.get('problems', {}).items())]
+    if age > 300:
+        problems.insert(0, 'Health monitor last ran %d minutes ago' % (age // 60))
+    return problems
 
 
 def is_token_valid(supplied):
@@ -1471,6 +1567,13 @@ PAGE_TEMPLATE = """<!doctype html>
                       border-radius: 8px; border: 1px solid #3a3a3c; background: #111;
                       color: #9b9ba1; font-size: 13px; }
   .copy-guest { background: #2c2c2e; color: #eee; }
+  .health-banner { background: #3a1d1d; border: 1px solid #ff453a; color: #ffb4ae; border-radius: 10px;
+                   padding: 10px 14px; margin-bottom: 14px; font-size: 14px; }
+  .health-banner b { color: #ff6b61; }
+  .admin-email-row { display: flex; gap: 6px; margin-top: 8px; }
+  .admin-email-row input { flex: 1 1 auto; min-width: 0; }
+  .admin-email-row button { flex: none; width: auto; padding: 8px 12px; font-size: 13px; }
+  .add-admin-btn { width: 100%; margin-top: 8px; padding: 12px 0; font-size: 15px; }
   .revoke-guest { background: transparent; border: 1px solid #ff453a; color: #ff453a; }
   .guest-label-input { width: 100%; box-sizing: border-box; padding: 14px; font-size: 16px;
                         border-radius: 10px; border: 1px solid #3a3a3c; background: #1c1c1e;
@@ -1548,8 +1651,19 @@ PAGE_TEMPLATE = """<!doctype html>
 </head>
 <body>
 <h1><img src="/icon.svg" alt="" class="app-icon">Reward Time</h1>
+<div class="health-banner" id="health-banner" style="display:none"></div>
 <div id="cards"></div>
 <div id="admin-section" style="display:none">
+  <h2>Admin Links</h2>
+  <div id="admin-links-list"></div>
+  <div class="card collapsed" id="add-admin-card">
+    <div class="card-head" data-card-id="-2"><div class="name">Add an admin link</div></div>
+    <div class="add-token-body">
+      <input class="guest-label-input" id="admin-label" placeholder="Name (shows in activity)">
+      <input class="guest-label-input" id="admin-email" type="email" placeholder="Alert email (optional)">
+      <button class="add-admin-btn" id="add-admin-btn">Create admin link</button>
+    </div>
+  </div>
   <h2>Babysitter Access</h2>
   <div id="guest-tokens-list"></div>
   <div class="card" id="add-token-card">
@@ -1920,6 +2034,7 @@ function saveExpanded(ids) {
 }
 
 var ADD_TOKEN_CARD_ID = -1;
+var ADD_ADMIN_CARD_ID = -2;
 
 function toggleExpanded(id) {
   var expandedIds = loadExpanded();
@@ -1933,8 +2048,8 @@ function toggleExpanded(id) {
     // Expanding a card near the bottom of the page reveals its new content
     // below the current scroll position - bring it into view rather than
     // leaving the user to notice and scroll down manually.
-    var el = id === ADD_TOKEN_CARD_ID
-      ? document.getElementById('add-token-card')
+    var el = id === ADD_TOKEN_CARD_ID ? document.getElementById('add-token-card')
+      : id === ADD_ADMIN_CARD_ID ? document.getElementById('add-admin-card')
       : document.querySelector('.card-head[data-card-id="' + id + '"]');
     if (el) {
       if (el.closest) { el = el.closest('.card') || el; }
@@ -1944,8 +2059,9 @@ function toggleExpanded(id) {
 }
 
 function updateAddTokenCardCollapsedState() {
-  var isCollapsed = loadExpanded().indexOf(ADD_TOKEN_CARD_ID) === -1;
-  document.getElementById('add-token-card').classList.toggle('collapsed', isCollapsed);
+  var expandedIds = loadExpanded();
+  document.getElementById('add-token-card').classList.toggle('collapsed', expandedIds.indexOf(ADD_TOKEN_CARD_ID) === -1);
+  document.getElementById('add-admin-card').classList.toggle('collapsed', expandedIds.indexOf(ADD_ADMIN_CARD_ID) === -1);
 }
 
 function applyOrder(profiles) {
@@ -2015,6 +2131,8 @@ function loadProfiles() {
       isAdmin = data.is_admin;
       var section = document.getElementById('admin-section');
       section.style.display = isAdmin ? 'block' : 'none';
+      renderHealth(isAdmin ? data.health : []);
+      if (isAdmin) loadAdminLinks();
       if (isAdmin) {
         renderDurationButtons();
         loadGuestTokens();
@@ -2069,6 +2187,58 @@ function toggleGuestExpanded(token) {
       el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
   }
+}
+
+function renderHealth(problems) {
+  var el = document.getElementById('health-banner');
+  if (!problems || !problems.length) { el.style.display = 'none'; return; }
+  el.innerHTML = '<b>Something needs attention</b><br>' + problems.map(escapeHtml).join('<br>');
+  el.style.display = '';
+}
+
+var lastAdminLinks = [];
+var expandedAdminLinks = {};
+
+function renderAdminLinks(admins) {
+  lastAdminLinks = admins;
+  var el = document.getElementById('admin-links-list');
+  // An open email field keeps its in-progress text across the periodic refresh.
+  var drafts = {};
+  Array.prototype.forEach.call(el.querySelectorAll('input[data-admin-email]'), function (input) {
+    drafts[input.dataset.adminEmail] = input.value;
+  });
+  el.innerHTML = admins.map(function (a) {
+    var isCollapsed = !expandedAdminLinks[a.token];
+    var sub = (a.is_me ? 'you &middot; ' : '') + (a.email ? 'alerts to ' + escapeHtml(a.email) : 'no alerts');
+    var email = a.token in drafts ? drafts[a.token] : a.email;
+    return '<div class="guest-row' + (isCollapsed ? ' collapsed' : '') + '">' +
+           '<div class="guest-row-head" data-admin-toggle="' + a.token + '">' +
+           '<div><div class="label">' + escapeHtml(a.label) + '</div>' +
+           '<div class="expires">' + sub + '</div></div>' +
+           '<div class="guest-row-btns">' +
+           '<button class="copy-guest" data-copy-guest="' + a.token + '">Copy</button>' +
+           (a.is_me ? '' : '<button class="revoke-guest" data-revoke-admin="' + a.token + '">Revoke</button>') +
+           '</div></div>' +
+           '<div class="guest-row-body"><input class="guest-url-field" readonly ' +
+           'onclick="this.select()" value="' + escapeHtml(guestUrl(a.token)) + '">' +
+           '<div class="admin-email-row"><input class="guest-url-field" type="email" placeholder="Alert email (optional)" ' +
+           'data-admin-email="' + a.token + '" value="' + escapeHtml(email) + '">' +
+           '<button class="copy-guest" data-save-admin-email="' + a.token + '">Save</button></div></div>' +
+           '</div>';
+  }).join('');
+}
+
+function loadAdminLinks() {
+  fetch('/api/admins?token=' + encodeURIComponent(TOKEN))
+    .then(function (r) { return r.json(); })
+    .then(renderAdminLinks);
+}
+
+function adminPost(path, params) {
+  var query = Object.keys(params).map(function (k) {
+    return '&' + k + '=' + encodeURIComponent(params[k]);
+  }).join('');
+  return fetch(path + '?token=' + encodeURIComponent(TOKEN) + query, { method: 'POST' }).then(parseResponse);
 }
 
 function loadGuestTokens() {
@@ -2173,6 +2343,59 @@ document.addEventListener('click', function (e) {
       })
       .catch(function (err) { toast(err.message || 'Failed - check connection'); })
       .finally(function () { setBusy(durationBtn, false); });
+    return;
+  }
+
+  if (e.target.closest('#add-admin-btn')) {
+    var addBtn = e.target.closest('#add-admin-btn');
+    var name = document.getElementById('admin-label').value.trim();
+    if (!name) { toast('Give the new admin link a name'); return; }
+    setBusy(addBtn, true);
+    adminPost('/api/admins/create', { label: name, email: document.getElementById('admin-email').value.trim() })
+      .then(function (result) {
+        copyText(guestUrl(result.token));
+        document.getElementById('admin-label').value = '';
+        document.getElementById('admin-email').value = '';
+        loadAdminLinks();
+      })
+      .catch(function (err) { toast(err.message || 'Failed - check connection'); })
+      .finally(function () { setBusy(addBtn, false); });
+    return;
+  }
+
+  var saveEmailBtn = e.target.closest('button[data-save-admin-email]');
+  if (saveEmailBtn) {
+    var target = saveEmailBtn.dataset.saveAdminEmail;
+    var input = document.querySelector('input[data-admin-email="' + target + '"]');
+    saveEmailBtn.disabled = true;
+    adminPost('/api/admins/set_email', { admin_token: target, email: input.value.trim() })
+      .then(function () {
+        toast(input.value.trim() ? 'Alerts will go to ' + input.value.trim() : 'Alerts turned off');
+        input.removeAttribute('data-admin-email');
+        loadAdminLinks();
+      })
+      .catch(function (err) { toast(err.message || 'Failed - check connection'); })
+      .finally(function () { saveEmailBtn.disabled = false; });
+    return;
+  }
+
+  var revokeAdminBtn = e.target.closest('button[data-revoke-admin]');
+  if (revokeAdminBtn) {
+    var who = lastAdminLinks.filter(function (a) { return a.token === revokeAdminBtn.dataset.revokeAdmin; })[0];
+    if (!confirm('Revoke the admin link for ' + (who ? who.label : 'this person') + '? It stops working immediately.')) return;
+    revokeAdminBtn.disabled = true;
+    adminPost('/api/admins/revoke', { admin_token: revokeAdminBtn.dataset.revokeAdmin })
+      .then(function () { toast('Admin link revoked'); loadAdminLinks(); })
+      .catch(function (err) { toast(err.message || 'Failed - check connection'); })
+      .finally(function () { revokeAdminBtn.disabled = false; });
+    return;
+  }
+
+  var adminToggle = e.target.closest('[data-admin-toggle]');
+  if (adminToggle && !e.target.closest('button')) {
+    var t = adminToggle.dataset.adminToggle;
+    expandedAdminLinks[t] = !expandedAdminLinks[t];
+    renderAdminLinks(lastAdminLinks);
     return;
   }
 
@@ -2386,10 +2609,23 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not self._token_ok(qs):
                 self._send_json({'error': 'forbidden'}, status=403)
                 return
-            self._send_json({
-                'profiles': get_profiles(),
-                'is_admin': is_admin_token(self._supplied_token(qs)),
-            })
+            admin = get_admin(self._supplied_token(qs))
+            status = {'profiles': get_profiles(), 'is_admin': admin is not None}
+            if admin:
+                status['me'] = admin['label']
+                status['health'] = get_health()
+            self._send_json(status)
+            return
+
+        if parsed.path == '/api/admins':
+            if not is_admin_token(self._supplied_token(qs)):
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            me = self._supplied_token(qs)
+            admins = list_admin_tokens()
+            for a in admins:
+                a['is_me'] = a['token'] == me
+            self._send_json(admins)
             return
 
         if parsed.path == '/api/tokens':
@@ -2504,6 +2740,40 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
             new_token = create_guest_token(label, expires_at)
             self._send_json({'ok': True, 'token': new_token})
+            return
+
+        if parsed.path in ('/api/admins/create', '/api/admins/set_email', '/api/admins/revoke'):
+            me = self._supplied_token(qs)
+            if not is_admin_token(me):
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            email = qs.get('email', [''])[0].strip()
+            if email and not EMAIL_RE.match(email):
+                self._send_json({'error': "That email address doesn't look right"}, status=400)
+                return
+            if parsed.path == '/api/admins/create':
+                label = qs.get('label', [''])[0].strip()
+                if not label:
+                    self._send_json({'error': 'Give the new admin link a name'}, status=400)
+                    return
+                self._send_json({'ok': True, 'token': create_admin_token(label, email)})
+                return
+            target = qs.get('admin_token', [''])[0]
+            if not target:
+                self._send_json({'error': 'bad request'}, status=400)
+                return
+            if parsed.path == '/api/admins/set_email':
+                set_admin_email(target, email)
+            else:
+                if target == me:
+                    self._send_json({'error': "You can't revoke your own link"}, status=400)
+                    return
+                try:
+                    revoke_admin_token(target)
+                except ValueError as exc:
+                    self._send_json({'error': str(exc)}, status=400)
+                    return
+            self._send_json({'ok': True})
             return
 
         if parsed.path == '/api/tokens/revoke':

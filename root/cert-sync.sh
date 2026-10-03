@@ -27,6 +27,17 @@ SRC_CERT=/usr/syno/etc/ssl/ssl.crt/server.crt
 SRC_KEY=/usr/syno/etc/ssl/ssl.key/server.key
 BUILD_DIR="$ROOT_DIR/cert-build"
 DST_DIR="$APP_DIR/cert"
+STATUS_FILE="$ROOT_DIR/cert-sync.status"
+RESULT="failed"
+
+# Records the outcome of every run (including set -e bail-outs, which leave
+# RESULT at "failed") for the monitor to read.
+write_status() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $RESULT" > "$STATUS_FILE.tmp"
+  chmod 644 "$STATUS_FILE.tmp"
+  mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
+trap write_status EXIT
 
 as_app_user() {
   su "$APP_USER" -c "$1"
@@ -46,5 +57,8 @@ if ! as_app_user "cat '$DST_DIR/fullchain.pem'" 2>/dev/null | cmp -s - "$BUILD_D
   as_app_user "umask 077 && cat > '$DST_DIR/.privkey.new' && mv '$DST_DIR/.privkey.new' '$DST_DIR/privkey.pem'" \
     < "$BUILD_DIR/privkey.pem"
   as_app_user "cd '$APP_DIR' && [ -f server.pid ] && kill \"\$(cat server.pid)\" 2>/dev/null; true"
+  RESULT="ok - certificate updated, app restarted"
+else
+  RESULT="ok - unchanged"
 fi
 rm -rf "$BUILD_DIR"

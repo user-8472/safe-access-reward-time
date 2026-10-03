@@ -4,4 +4,5 @@ cert/
 tokens.db
 pending/
 *.log
+*.log.[0-9]
 *.pid

@@ -23,6 +23,10 @@ import time
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PENDING_DIR = '__APP_DIR__/pending'
 MAX_REQUEST_BYTES = 4096
+# Rewritten every HEARTBEAT_SECONDS so the unprivileged app and monitor can
+# tell this daemon is alive (they can't signal a root process to check).
+HEARTBEAT_PATH = os.path.join(ROOT_DIR, 'apply_daemon.heartbeat')
+HEARTBEAT_SECONDS = 30
 SYNOWEBAPI = '/usr/syno/bin/synowebapi'
 API = 'SYNO.SafeAccess.AccessControl.ConfigGroup.Reward.Ultra'
 POLL_SECONDS = 0.3
@@ -152,11 +156,26 @@ def process_group(cgid, items):
             finish_error(path, base, exc)
 
 
+def write_heartbeat():
+    tmp = HEARTBEAT_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('%d\n' % int(time.time()))
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, HEARTBEAT_PATH)
+
+
 def main():
     # PENDING_DIR is created by the app itself (as the app user); creating it
     # here as root would leave the app unable to write to it.
     log.info('apply_daemon started')
+    last_heartbeat = 0
     while True:
+        if time.time() - last_heartbeat >= HEARTBEAT_SECONDS:
+            try:
+                write_heartbeat()
+            except Exception:
+                log.exception('heartbeat write failed')
+            last_heartbeat = time.time()
         groups = {}
         for path in sorted(glob.glob(os.path.join(PENDING_DIR, '*.json'))):
             base = path[:-len('.json')]

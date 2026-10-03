@@ -34,5 +34,14 @@ if is_alive; then
   sleep 1
 fi
 
-nohup python reward_server.py > server.log 2>&1 &
+# server.log is the app's own rotating log, so it's never redirected here -
+# "> server.log" used to wipe it on every restart, losing exactly the log
+# you'd want after a crash. Anything printed outside the logger (startup
+# errors, tracebacks) is appended to server.crash.log instead, with one
+# previous copy kept once it passes 1MB. Each restart is also recorded there.
+if [ -f server.crash.log ] && [ "$(wc -c < server.crash.log)" -gt 1048576 ]; then
+  mv server.crash.log server.crash.log.1
+fi
+echo "$(date '+%Y-%m-%d %H:%M:%S') watchdog: starting reward_server.py" >> server.crash.log
+nohup python reward_server.py >> server.crash.log 2>&1 &
 echo $! > server.pid
