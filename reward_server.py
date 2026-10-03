@@ -54,6 +54,17 @@ TOKENS_DB_PATH = os.path.join(APP_DIR, 'tokens.db')
 
 
 MONITOR_STATE_PATH = os.path.join(APP_DIR, 'monitor.state')
+# Timed pauses are tracked by apply_daemon (Safe Access itself only pauses
+# indefinitely): {config_group_id: unpause_at}, world-readable.
+PAUSES_PATH = os.path.join(CONFIG.get('root_dir', APP_DIR + '-root'), 'pauses.json')
+
+
+def load_pauses():
+    try:
+        with open(PAUSES_PATH) as f:
+            return dict((int(k), int(v)) for k, v in json.load(f).items())
+    except (IOError, ValueError):
+        return {}
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
 
@@ -250,14 +261,15 @@ def list_activity(who=None, limit=100):
         now = int(time.time())
         summary = {}
         for period, days in (('week', 7), ('month', 30)):
-            for actor, actor_kind, grants, custom, revokes, minutes in conn.execute(
+            for actor, actor_kind, grants, custom, revokes, pauses, minutes in conn.execute(
                     "SELECT actor, actor_kind, "
                     "SUM(action = 'grant'), SUM(action = 'set_until'), SUM(action = 'revoke'), "
-                    "SUM(CASE WHEN minutes > 0 THEN minutes ELSE 0 END) "
+                    "SUM(action = 'pause'), "
+                    "SUM(CASE WHEN action IN ('grant', 'set_until') AND minutes > 0 THEN minutes ELSE 0 END) "
                     "FROM activity WHERE ok = 1 AND ts >= ? GROUP BY actor", (now - days * 86400,)):
                 summary.setdefault(actor, {'kind': actor_kind})[period] = {
-                    'grants': grants or 0, 'custom': custom or 0,
-                    'revokes': revokes or 0, 'minutes': minutes or 0}
+                    'grants': grants or 0, 'custom': custom or 0, 'revokes': revokes or 0,
+                    'pauses': pauses or 0, 'minutes': minutes or 0}
     finally:
         conn.close()
     events = [{'ts': r[0], 'actor': r[1], 'actor_kind': r[2], 'action': r[3], 'profile': r[4],
@@ -338,6 +350,7 @@ def get_profiles():
         # starting on the hour; today = since local midnight.
         lt = time.localtime(now)
         today_start = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+        pauses = load_pauses()
         rows = conn.execute(
             "SELECT profile.id, profile.name "
             "FROM profile JOIN config_group ON config_group.profile_id = profile.id "
@@ -354,6 +367,9 @@ def get_profiles():
             remaining = remaining_row[0]
             remaining_minutes = int((remaining - now) / 60) if remaining else 0
             schedule_state, window_start, window_end = get_schedule_window(conn, profile_id, now)
+            paused = conn.execute(
+                "SELECT pause_expired IS NOT NULL FROM config_group WHERE id = ?", (profile_id,)
+            ).fetchone()
             normal_used, reward_used = conn.execute(
                 "SELECT SUM(normal_spent), SUM(reward_spent) FROM config_group_hour_timespent "
                 "WHERE parent_id = ? AND timestamp >= ?", (profile_id, today_start)
@@ -368,6 +384,9 @@ def get_profiles():
                 'schedule_window_end': window_end,
                 'used_today_minutes': (normal_used or 0) + (reward_used or 0),
                 'reward_used_today_minutes': reward_used or 0,
+                'paused': bool(paused and paused[0]),
+                # None while paused = no end time (e.g. paused from the DS router app)
+                'paused_until': pauses.get(profile_id),
             })
         return profiles
     finally:
@@ -481,6 +500,14 @@ def set_expiry(profile_id, expires_at, request_id):
 
 def revoke_time(profile_id, request_id):
     enqueue_and_wait('revoke', profile_id, request_id)
+
+
+def pause_profile(profile_id, until, request_id):
+    enqueue_and_wait('pause', profile_id, request_id, until=until)
+
+
+def unpause_profile(profile_id, request_id):
+    enqueue_and_wait('unpause', profile_id, request_id)
 
 
 ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
@@ -1593,6 +1620,10 @@ PAGE_TEMPLATE = """<!doctype html>
   .revoke:active { background: rgba(255, 69, 58, 0.15); }
   .card.collapsed .custom-btn { display: none; }
   .custom-btn { grid-column: 1 / -1; background: #2c2c2e; margin-top: 2px; }
+  .pause-btn { background: #3a2a10; color: #ffb340; }
+  .pause-btn.resume { grid-column: 1 / -1; }
+  .paused-line { color: #ffb340; font-weight: 600; margin: -8px 0 12px; }
+  .card.collapsed .paused-line { margin: 2px 0 0; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none;
                      align-items: center; justify-content: center; z-index: 100;
                      padding: 16px; box-sizing: border-box; }
@@ -1922,7 +1953,8 @@ function openPicker(context) {
   updateDateButton();
   document.getElementById('cal-panel').classList.remove('open');
   document.getElementById('modal-title').textContent =
-    context.type === 'reward' ? 'Custom reward time' : 'Custom access length';
+    context.type === 'reward' ? 'Custom reward time'
+    : context.type === 'pause' ? 'Pause internet until' : 'Custom access length';
   document.getElementById('modal-status-line').textContent = '';
   document.getElementById('modal-backdrop').classList.add('open');
 }
@@ -1943,6 +1975,13 @@ function submitPicker() {
   var epoch = getPickerEpoch();
   if (epoch <= Math.floor(Date.now() / 1000)) {
     toast('Pick a time in the future');
+    return;
+  }
+
+  if (modalContext.type === 'pause') {
+    var pauseProfileId = modalContext.profileId;
+    closePicker();
+    sendProfileAction(pauseProfileId, '/api/pause', '&until=' + epoch, 'Paused');
     return;
   }
 
@@ -2212,11 +2251,17 @@ function render(profiles) {
       '<button class="move" data-move-id="' + p.id + '" data-dir="down"' + (idx === ordered.length - 1 ? ' disabled' : '') + '>&#9660;</button>' +
       '</div>';
     var untilRow = '<button class="custom-btn" data-open-reward-picker="' + p.id + '">Custom</button>';
+    var pauseBtns = p.paused
+      ? '<button class="pause-btn resume" data-unpause-id="' + p.id + '">Resume internet</button>'
+      : '<button class="pause-btn" data-pause-id="' + p.id + '" data-pause-minutes="60">Pause 1h</button>' +
+        '<button class="pause-btn" data-open-pause-picker="' + p.id + '">Pause until&hellip;</button>';
+    var pausedLine = !p.paused ? ''
+      : '<div class="paused-line">Paused ' + (p.paused_until ? 'until ' + formatUntil(p.paused_until) : '(no end time)') + '</div>';
     card.innerHTML = '<div class="card-head" data-card-id="' + p.id + '"><div class="name">' + escapeHtml(p.name) + '</div>' + moveBtns + '</div>' +
-                      '<div class="remaining" data-remaining="' + p.id + '">' + remainingText + '</div>' +
+                      '<div class="remaining" data-remaining="' + p.id + '">' + remainingText + '</div>' + pausedLine +
                       '<div class="schedule">' + scheduleText(p) + '</div>' +
                       '<div class="schedule">' + usageText(p) + '</div>' +
-                      '<div class="btns">' + btns + untilRow + revokeBtnHtml + '</div>';
+                      '<div class="btns">' + btns + untilRow + revokeBtnHtml + pauseBtns + '</div>';
     el.appendChild(card);
   });
 }
@@ -2389,6 +2434,8 @@ function describeActivity(e) {
       return who + ' until ' + formatUntil(e.until) +
              (e.minutes ? ' (' + (e.minutes > 0 ? '+' : '-') + mins(e.minutes) + ')' : '');
     case 'revoke': return 'revoked ' + who + (e.minutes ? ' (-' + mins(e.minutes) + ')' : '');
+    case 'pause': return 'paused ' + who + ' until ' + formatUntil(e.until);
+    case 'unpause': return 'resumed ' + who;
     case 'guest_link_created': return 'created babysitter link ' + escapeHtml(e.detail || '');
     case 'guest_link_revoked': return 'revoked babysitter link ' + escapeHtml(e.detail || '');
     case 'admin_link_created': return 'created admin link ' + escapeHtml(e.detail || '');
@@ -2401,9 +2448,10 @@ function describeActivity(e) {
 function renderActivity(data) {
   var people = Object.keys(data.summary).sort();
   var cell = function (s) {
-    if (!s || !(s.grants + s.custom + s.revokes)) return '&ndash;';
+    if (!s || !(s.grants + s.custom + s.revokes + s.pauses)) return '&ndash;';
     return (s.grants + s.custom) + ' &middot; ' + formatRemaining(s.minutes) +
-           (s.revokes ? ' &middot; ' + s.revokes + ' revoked' : '');
+           (s.revokes ? ' &middot; ' + s.revokes + ' revoked' : '') +
+           (s.pauses ? ' &middot; ' + s.pauses + ' paused' : '');
   };
   document.getElementById('activity-summary').innerHTML = people.length
     ? '<tr><th></th><th>Last 7 days</th><th>Last 30 days</th></tr>' + people.map(function (name) {
@@ -2469,7 +2517,41 @@ function guestUrl(token) {
 }
 
 
+// Sends a per-profile action, showing its progress in the card like the
+// reward buttons do.
+function sendProfileAction(profileId, path, extraParams, doneMessage) {
+  beginBusy(profileId);
+  var reqId = newRequestId();
+  var poll = pollRequestStatus(reqId, function (label) {
+    profileStageText[profileId] = label;
+    updateBusyDisplay(profileId);
+  });
+  fetch(path + '?token=' + encodeURIComponent(TOKEN) + '&profile_id=' + profileId +
+        extraParams + '&request_id=' + reqId, { method: 'POST' })
+    .then(parseResponse)
+    .then(function () { toast(doneMessage); })
+    .catch(function (err) { toast(err.message || 'Failed - check connection'); })
+    .finally(function () { clearInterval(poll); endBusy(profileId); });
+}
+
 document.addEventListener('click', function (e) {
+  var pauseBtn = e.target.closest('button[data-pause-id]');
+  if (pauseBtn) {
+    sendProfileAction(pauseBtn.dataset.pauseId, '/api/pause',
+                      '&minutes=' + pauseBtn.dataset.pauseMinutes, 'Paused for 1 hour');
+    return;
+  }
+  var unpauseBtn = e.target.closest('button[data-unpause-id]');
+  if (unpauseBtn) {
+    sendProfileAction(unpauseBtn.dataset.unpauseId, '/api/unpause', '', 'Internet resumed');
+    return;
+  }
+  var pausePickerBtn = e.target.closest('button[data-open-pause-picker]');
+  if (pausePickerBtn) {
+    openPicker({ type: 'pause', profileId: pausePickerBtn.dataset.openPausePicker });
+    return;
+  }
+
   var grantBtn = e.target.closest('button[data-id]');
   if (grantBtn) {
     var grantId = grantBtn.dataset.id;
@@ -2923,6 +3005,50 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send_json({'error': str(exc)}, status=500)
                 return
             record_activity(actor, 'revoke', profile_id, minutes=removed)
+            self._send_json({'ok': True})
+            return
+
+        if parsed.path in ('/api/pause', '/api/unpause'):
+            actor = get_actor(self._supplied_token(qs))
+            if not actor:
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            try:
+                profile_id = int(qs['profile_id'][0])
+            except (KeyError, ValueError):
+                self._send_json({'error': 'bad request'}, status=400)
+                return
+            if not can_change(actor, profile_id):
+                self._send_json({'error': "This link can't change that profile"}, status=403)
+                return
+            now = int(time.time())
+            action = parsed.path[len('/api/'):]
+            until = None
+            if action == 'pause':
+                try:
+                    if 'minutes' in qs:
+                        until = now + int(qs['minutes'][0]) * 60
+                    else:
+                        until = int(qs['until'][0])
+                except (KeyError, ValueError):
+                    self._send_json({'error': 'bad request'}, status=400)
+                    return
+                if until <= now or until > now + 32 * 24 * 3600:
+                    self._send_json({'error': 'Pick a time within one month from now'}, status=400)
+                    return
+            minutes = (until - now) // 60 if until else None
+            try:
+                if action == 'pause':
+                    pause_profile(profile_id, until, self._request_id(qs))
+                else:
+                    unpause_profile(profile_id, self._request_id(qs))
+            except Exception as exc:
+                log.exception('%s failed for profile_id=%s', action, profile_id)
+                record_activity(actor, action, profile_id, minutes=minutes, until=until,
+                                ok=False, detail=str(exc))
+                self._send_json({'error': str(exc)}, status=500)
+                return
+            record_activity(actor, action, profile_id, minutes=minutes, until=until)
             self._send_json({'ok': True})
             return
 

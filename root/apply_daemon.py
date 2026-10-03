@@ -29,6 +29,13 @@ HEARTBEAT_PATH = os.path.join(ROOT_DIR, 'apply_daemon.heartbeat')
 HEARTBEAT_SECONDS = 30
 SYNOWEBAPI = '/usr/syno/bin/synowebapi'
 API = 'SYNO.SafeAccess.AccessControl.ConfigGroup.Reward.Ultra'
+PAUSE_API = 'SYNO.SafeAccess.AccessControl.ConfigGroup'
+# Safe Access only pauses indefinitely (it ignores any expiry), so timed
+# pauses are tracked here - {config_group_id: unpause_at} - and undone by
+# this daemon when due. World-readable so the app can show "paused until".
+PAUSES_PATH = os.path.join(ROOT_DIR, 'pauses.json')
+PAUSE_CHECK_SECONDS = 5
+PAUSE_ACTIONS = ('pause', 'unpause')
 POLL_SECONDS = 0.3
 
 log = logging.getLogger('apply_daemon')
@@ -62,6 +69,67 @@ def set_reward(config_group_id, available, expired):
         SYNOWEBAPI, '--exec', 'api=%s' % API, 'method=set', 'version=1',
         'config_group_id=%d' % config_group_id, 'ultra_rewards=%s' % payload
     ])
+
+
+def set_pause(config_group_id, paused):
+    subprocess.check_output([
+        SYNOWEBAPI, '--exec', 'api=%s' % PAUSE_API, 'method=set', 'version=1',
+        'config_group_id=%d' % config_group_id, 'pause=%s' % ('true' if paused else 'false')
+    ])
+
+
+def load_pauses():
+    try:
+        with open(PAUSES_PATH) as f:
+            return dict((int(k), int(v)) for k, v in json.load(f).items())
+    except (IOError, ValueError):
+        return {}
+
+
+def save_pauses(pauses):
+    tmp = PAUSES_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(dict((str(k), v) for k, v in pauses.items()), f)
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, PAUSES_PATH)
+
+
+def process_pause(path, base, req):
+    # 'pause' with until (epoch) for a timed pause, or until=0 for no end
+    # time; 'unpause' resumes now. Either replaces any earlier timed pause.
+    cgid = int(req['config_group_id'])
+    try:
+        write_stage(base, 'applying')
+        pauses = load_pauses()
+        if req['action'] == 'pause':
+            until = int(req.get('until', 0))
+            set_pause(cgid, True)
+            if until:
+                pauses[cgid] = until
+            else:
+                pauses.pop(cgid, None)
+        else:
+            set_pause(cgid, False)
+            pauses.pop(cgid, None)
+        save_pauses(pauses)
+        finish_ok(path, base, req['action'], cgid)
+    except Exception as exc:
+        finish_error(path, base, exc)
+
+
+def expire_pauses():
+    pauses = load_pauses()
+    now = int(time.time())
+    due = [cgid for cgid, until in pauses.items() if until <= now]
+    for cgid in due:
+        try:
+            set_pause(cgid, False)
+            pauses.pop(cgid)
+            log.info('pause ended config_group_id=%s', cgid)
+        except Exception:
+            log.exception('could not end pause for config_group_id=%s (will retry)', cgid)
+    if due:
+        save_pauses(pauses)
 
 
 def write_marker(path, content):
@@ -169,7 +237,14 @@ def main():
     # here as root would leave the app unable to write to it.
     log.info('apply_daemon started')
     last_heartbeat = 0
+    last_pause_check = 0
     while True:
+        if time.time() - last_pause_check >= PAUSE_CHECK_SECONDS:
+            try:
+                expire_pauses()
+            except Exception:
+                log.exception('pause expiry check failed')
+            last_pause_check = time.time()
         if time.time() - last_heartbeat >= HEARTBEAT_SECONDS:
             try:
                 write_heartbeat()
@@ -182,6 +257,9 @@ def main():
             try:
                 req = read_request(path)
                 cgid = int(req['config_group_id'])
+                if req.get('action') in PAUSE_ACTIONS:
+                    process_pause(path, base, req)
+                    continue
             except Exception as exc:
                 finish_error(path, base, exc)
                 continue
