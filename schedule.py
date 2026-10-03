@@ -63,3 +63,76 @@ def get_schedule_window(conn, profile_id, now):
         int(time.mktime((lt.tm_year, lt.tm_mon, sunday_mday, 0, minute, 0, 0, 0, -1)))
         for minute in window]
     return state, window_start, window_end
+
+
+# --- Schedule editing: allowed ("on") windows per day <-> blocked periods ---
+# The editor works in allowed windows, which is how people think about a
+# schedule ("6:00 AM - 9:00 PM"); Safe Access stores blocked periods. A day
+# is a list of [start, end] minute pairs within that day (0-1440); day 0 is
+# Sunday.
+
+def on_windows_from_blocks(blocks):
+    # blocks: iterable of (begin_weekday, begin_clock, end_weekday, end_clock),
+    # which may cross midnight or wrap from Saturday into Sunday.
+    blocked = []
+    for bw, bc, ew, ec in blocks:
+        start = _schedule_week_minute(bw, bc)
+        end = _schedule_week_minute(ew, ec)
+        if end <= start:
+            end += MINUTES_PER_WEEK
+        if end > MINUTES_PER_WEEK:  # wraps past Saturday night: split it
+            blocked.append((start, MINUTES_PER_WEEK))
+            blocked.append((0, end - MINUTES_PER_WEEK))
+        else:
+            blocked.append((start, end))
+    blocked.sort()
+    days = [[] for _ in range(7)]
+    position = 0
+    for start, end in blocked + [(MINUTES_PER_WEEK, MINUTES_PER_WEEK)]:
+        if start > position:
+            # An allowed gap - split it at each midnight it spans.
+            gap_start = position
+            while gap_start < start:
+                day = gap_start // 1440
+                day_end = min(start, (day + 1) * 1440)
+                days[day].append([gap_start - day * 1440, day_end - day * 1440])
+                gap_start = day_end
+        position = max(position, end)
+    return days
+
+
+def blocks_from_on_windows(days):
+    # Inverse of on_windows_from_blocks: same-day blocked periods, as the
+    # Safe Access API takes them. A fully allowed day has no blocks.
+    blocks = []
+    for weekday, windows in enumerate(days):
+        position = 0
+        for start, end in sorted(windows) + [[1440, 1440]]:
+            if start > position:
+                blocks.append({'begin_weekday': weekday, 'begin_clock': _clock(position),
+                               'end_weekday': weekday, 'end_clock': _clock(start)})
+            position = max(position, end)
+    return blocks
+
+
+def _clock(minute):
+    return (minute // 60) * 100 + minute % 60
+
+
+def validate_on_windows(days):
+    # Raises ValueError unless days is 7 lists of non-overlapping
+    # [start, end] minute pairs with 0 <= start < end <= 1440.
+    if not isinstance(days, list) or len(days) != 7:
+        raise ValueError('expected 7 days')
+    for windows in days:
+        if not isinstance(windows, list) or len(windows) > 12:
+            raise ValueError('bad day')
+        previous_end = -1
+        for window in sorted(windows):
+            if (not isinstance(window, list) or len(window) != 2
+                    or not all(isinstance(m, int) and not isinstance(m, bool) for m in window)):
+                raise ValueError('bad window')
+            start, end = window
+            if not (0 <= start < end <= 1440) or start < previous_end:
+                raise ValueError('windows must be within the day and not overlap')
+            previous_end = end

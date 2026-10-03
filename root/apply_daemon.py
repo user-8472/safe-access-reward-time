@@ -22,7 +22,7 @@ import time
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PENDING_DIR = '__APP_DIR__/pending'
-MAX_REQUEST_BYTES = 4096
+MAX_REQUEST_BYTES = 16384  # a full weekly schedule can be a few KB
 # Rewritten every HEARTBEAT_SECONDS so the unprivileged app and monitor can
 # tell this daemon is alive (they can't signal a root process to check).
 HEARTBEAT_PATH = os.path.join(ROOT_DIR, 'apply_daemon.heartbeat')
@@ -36,6 +36,8 @@ PAUSE_API = 'SYNO.SafeAccess.AccessControl.ConfigGroup'
 PAUSES_PATH = os.path.join(ROOT_DIR, 'pauses.json')
 PAUSE_CHECK_SECONDS = 5
 PAUSE_ACTIONS = ('pause', 'unpause')
+SCHEDULE_API = 'SYNO.SafeAccess.AccessControl.Profile.Schedule.Blocktime'
+MAX_SCHEDULE_BLOCKS = 7 * 13
 POLL_SECONDS = 0.3
 
 log = logging.getLogger('apply_daemon')
@@ -113,6 +115,40 @@ def process_pause(path, base, req):
             pauses.pop(cgid, None)
         save_pauses(pauses)
         finish_ok(path, base, req['action'], cgid)
+    except Exception as exc:
+        finish_error(path, base, exc)
+
+
+def check_blocktimes(blocktimes):
+    # Re-checked here (not just in the app) since this runs as root on a
+    # file the app wrote: only well-formed same-day blocked periods.
+    if not isinstance(blocktimes, list) or len(blocktimes) > MAX_SCHEDULE_BLOCKS:
+        raise ValueError('bad blocktimes')
+    clean = []
+    for b in blocktimes:
+        values = [b.get(k) for k in ('begin_weekday', 'begin_clock', 'end_weekday', 'end_clock')]
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+            raise ValueError('bad blocktime entry')
+        bw, bc, ew, ec = values
+        if not (0 <= bw <= 6 and bw == ew and 0 <= bc < ec <= 2400
+                and bc % 100 < 60 and ec % 100 < 60):
+            raise ValueError('bad blocktime entry')
+        clean.append({'begin_weekday': bw, 'begin_clock': bc, 'end_weekday': ew, 'end_clock': ec})
+    return clean
+
+
+def process_schedule(path, base, req):
+    profile_id = int(req['config_group_id'])
+    try:
+        write_stage(base, 'applying')
+        blocktimes = check_blocktimes(req.get('blocktimes'))
+        out = subprocess.check_output([
+            SYNOWEBAPI, '--exec', 'api=%s' % SCHEDULE_API, 'method=set', 'version=1',
+            'profile_id=%d' % profile_id, 'blocktimes=%s' % json.dumps(blocktimes)
+        ])
+        if not json.loads(out[out.index('{'):]).get('success'):
+            raise RuntimeError('Safe Access rejected the schedule')
+        finish_ok(path, base, 'set_schedule', profile_id)
     except Exception as exc:
         finish_error(path, base, exc)
 
@@ -259,6 +295,9 @@ def main():
                 cgid = int(req['config_group_id'])
                 if req.get('action') in PAUSE_ACTIONS:
                     process_pause(path, base, req)
+                    continue
+                if req.get('action') == 'set_schedule':
+                    process_schedule(path, base, req)
                     continue
             except Exception as exc:
                 finish_error(path, base, exc)

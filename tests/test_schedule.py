@@ -134,3 +134,58 @@ class ScheduleWindowTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+from schedule import on_windows_from_blocks, blocks_from_on_windows, validate_on_windows  # noqa: E402
+
+
+class ScheduleEditingTest(unittest.TestCase):
+    DAILY = [(d, 0, d, 600) for d in range(7)] + [(d, 2100, d, 2400) for d in range(7)]
+
+    def test_daily_blocks_become_daily_windows(self):
+        self.assertEqual(on_windows_from_blocks(self.DAILY), [[[360, 1260]]] * 7)
+
+    def test_whole_week_blocked_has_no_windows(self):
+        self.assertEqual(on_windows_from_blocks([(d, 0, d, 2400) for d in range(7)]), [[]] * 7)
+
+    def test_no_blocks_is_open_all_day(self):
+        self.assertEqual(on_windows_from_blocks([]), [[[0, 1440]]] * 7)
+
+    def test_block_wrapping_saturday_into_sunday(self):
+        days = on_windows_from_blocks([(6, 2200, 0, 800)])
+        self.assertEqual(days[0], [[480, 1440]])   # Sunday from 8:00
+        self.assertEqual(days[6], [[0, 1320]])     # Saturday until 22:00
+        self.assertEqual(days[3], [[0, 1440]])
+
+    def test_open_window_spanning_midnight_is_split_per_day(self):
+        # Blocked all week except Fri 20:00 -> Sat 02:00.
+        blocks = [(0, 0, 5, 2000), (6, 200, 6, 2400)]
+        days = on_windows_from_blocks(blocks)
+        self.assertEqual(days[5], [[1200, 1440]])
+        self.assertEqual(days[6], [[0, 120]])
+
+    def test_round_trip(self):
+        days = on_windows_from_blocks(self.DAILY)
+        self.assertEqual(on_windows_from_blocks(
+            [(b['begin_weekday'], b['begin_clock'], b['end_weekday'], b['end_clock'])
+             for b in blocks_from_on_windows(days)]), days)
+
+    def test_blocks_from_windows_shape(self):
+        days = [[[360, 1260]]] + [[]] * 5 + [[[0, 1440]]]
+        self.assertEqual(blocks_from_on_windows(days), [
+            {'begin_weekday': 0, 'begin_clock': 0, 'end_weekday': 0, 'end_clock': 600},
+            {'begin_weekday': 0, 'begin_clock': 2100, 'end_weekday': 0, 'end_clock': 2400},
+        ] + [{'begin_weekday': d, 'begin_clock': 0, 'end_weekday': d, 'end_clock': 2400} for d in range(1, 6)])
+
+    def test_two_windows_in_a_day(self):
+        days = [[[420, 480], [960, 1200]]] + [[]] * 6
+        blocks = blocks_from_on_windows(days)[:3]
+        self.assertEqual([(b['begin_clock'], b['end_clock']) for b in blocks],
+                         [(0, 700), (800, 1600), (2000, 2400)])
+
+    def test_validation(self):
+        validate_on_windows([[[360, 1260]]] * 7)
+        for bad in ([[]] * 6, [[[0, 1441]]] + [[]] * 6, [[[600, 500]]] + [[]] * 6,
+                    [[[0, 600], [500, 700]]] + [[]] * 6, [[['a', 5]]] + [[]] * 6,
+                    [[[True, 5]]] + [[]] * 6):
+            self.assertRaises(ValueError, validate_on_windows, bad)

@@ -18,7 +18,8 @@ import time
 import urllib
 import urlparse
 
-from schedule import get_schedule_window
+from schedule import (get_schedule_window, on_windows_from_blocks, blocks_from_on_windows,
+                      validate_on_windows)
 
 REQUEST_TIMEOUT_SECONDS = 20
 
@@ -247,8 +248,8 @@ def record_activity(actor, action, profile_id=None, minutes=None, until=None, ok
 def list_activity(who=None, limit=100):
     conn = get_tokens_db()
     try:
-        query = ("SELECT ts, actor, actor_kind, action, profile_name, minutes, until, ok, detail "
-                 "FROM activity")
+        query = ("SELECT ts, actor, actor_kind, action, profile_name, minutes, until, ok, detail, "
+                 "profile_id FROM activity")
         args = []
         if who:
             query += " WHERE actor = ?"
@@ -273,7 +274,8 @@ def list_activity(who=None, limit=100):
     finally:
         conn.close()
     events = [{'ts': r[0], 'actor': r[1], 'actor_kind': r[2], 'action': r[3], 'profile': r[4],
-               'minutes': r[5], 'until': r[6], 'ok': bool(r[7]), 'detail': r[8]} for r in rows]
+               'minutes': r[5], 'until': r[6], 'ok': bool(r[7]), 'detail': r[8],
+               'profile_id': r[9]} for r in rows]
     return {'events': events, 'people': people, 'summary': summary}
 
 
@@ -500,6 +502,21 @@ def set_expiry(profile_id, expires_at, request_id):
 
 def revoke_time(profile_id, request_id):
     enqueue_and_wait('revoke', profile_id, request_id)
+
+
+def get_on_windows(profile_id):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT begin_weekday, begin_clock, end_weekday, end_clock "
+            "FROM schedule WHERE profile_id = ? AND type = 3", (profile_id,)).fetchall()
+    finally:
+        conn.close()
+    return on_windows_from_blocks(rows)
+
+
+def set_schedule(profile_id, days, request_id):
+    enqueue_and_wait('set_schedule', profile_id, request_id, blocktimes=blocks_from_on_windows(days))
 
 
 def pause_profile(profile_id, until, request_id):
@@ -1665,6 +1682,20 @@ PAGE_TEMPLATE = """<!doctype html>
   .modal-actions { display: flex; gap: 10px; }
   .modal-actions button { flex: 1; padding: 14px 0; }
   .modal-cancel-btn { background: #2c2c2e; }
+  .sched-box { max-width: 420px; }
+  .sched-day { border-bottom: 1px solid #2c2c2e; padding: 8px 0; }
+  .sched-day-head { display: flex; justify-content: space-between; align-items: center; }
+  .sched-day-name { font-weight: 700; }
+  .sched-links button { background: none; color: #0a84ff; padding: 4px 6px; font-size: 13px; font-weight: 600; width: auto; }
+  .sched-chip { display: inline-flex; align-items: center; gap: 6px; background: #2c2c2e; border-radius: 8px;
+                padding: 5px 8px; margin: 6px 6px 0 0; font-size: 14px; }
+  .sched-chip button { background: none; color: #ff453a; padding: 0 2px; font-size: 16px; width: auto; }
+  .sched-none { color: #9b9ba1; font-size: 14px; margin-top: 4px; }
+  .sched-add { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+  .sched-add select { padding: 8px; font-size: 14px; background: #2c2c2e; color: #eee; border: none; border-radius: 8px; }
+  .sched-add button { width: auto; padding: 8px 12px; font-size: 14px; }
+  .sched-btn { grid-column: 1 / -1; background: #2c2c2e; font-size: 15px; padding: 12px 0; }
+  .activity-undo { background: none; color: #0a84ff; width: auto; padding: 2px 0; font-size: 13px; }
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
            width: calc(100% - 32px); max-width: 448px; background: #30d158;
            color: #052e13; padding: 16px; border-radius: 12px; text-align: center;
@@ -1831,6 +1862,17 @@ PAGE_TEMPLATE = """<!doctype html>
     <div class="modal-actions">
       <button type="button" class="modal-cancel-btn" id="modal-cancel-btn">Cancel</button>
       <button type="button" id="modal-set-btn">Set</button>
+    </div>
+  </div>
+</div>
+<div class="modal-backdrop" id="sched-backdrop">
+  <div class="modal-box sched-box">
+    <div class="modal-title" id="sched-title">Schedule</div>
+    <div class="sched-none" style="text-align:center;margin-bottom:6px">Times when internet is allowed</div>
+    <div id="sched-days"></div>
+    <div class="modal-actions" style="margin-top:14px">
+      <button type="button" class="modal-cancel-btn" id="sched-cancel-btn">Cancel</button>
+      <button type="button" id="sched-save-btn">Save</button>
     </div>
   </div>
 </div>
@@ -2261,7 +2303,9 @@ function render(profiles) {
                       '<div class="remaining" data-remaining="' + p.id + '">' + remainingText + '</div>' + pausedLine +
                       '<div class="schedule">' + scheduleText(p) + '</div>' +
                       '<div class="schedule">' + usageText(p) + '</div>' +
-                      '<div class="btns">' + btns + untilRow + revokeBtnHtml + pauseBtns + '</div>';
+                      '<div class="btns">' + btns + untilRow + revokeBtnHtml + pauseBtns +
+                      (isAdmin ? '<button class="sched-btn" data-edit-schedule="' + p.id + '">Edit schedule</button>' : '') +
+                      '</div>';
     el.appendChild(card);
   });
 }
@@ -2281,8 +2325,8 @@ function loadProfiles() {
       // started earlier could land after a faster, more recent one and
       // overwrite the screen with stale data.
       if (seq !== loadProfilesSeq) return;
-      render(data.profiles);
       isAdmin = data.is_admin;
+      render(data.profiles);
       var section = document.getElementById('admin-section');
       section.style.display = isAdmin ? 'block' : 'none';
       renderHealth(isAdmin ? data.health : []);
@@ -2435,6 +2479,14 @@ function describeActivity(e) {
              (e.minutes ? ' (' + (e.minutes > 0 ? '+' : '-') + mins(e.minutes) + ')' : '');
     case 'revoke': return 'revoked ' + who + (e.minutes ? ' (-' + mins(e.minutes) + ')' : '');
     case 'pause': return 'paused ' + who + ' until ' + formatUntil(e.until);
+    case 'schedule_set':
+      try {
+        var change = JSON.parse(e.detail);
+        var changed = DAY_NAMES.filter(function (name, d) {
+          return JSON.stringify(change.before[d]) !== JSON.stringify(change.after[d]);
+        }).map(function (name) { return name.slice(0, 3); });
+        return 'changed schedule for ' + who + (changed.length ? ' (' + changed.join(', ') + ')' : ' (no change)');
+      } catch (err) { return 'changed schedule for ' + who; }
     case 'unpause': return 'resumed ' + who;
     case 'guest_link_created': return 'created babysitter link ' + escapeHtml(e.detail || '');
     case 'guest_link_revoked': return 'revoked babysitter link ' + escapeHtml(e.detail || '');
@@ -2444,6 +2496,8 @@ function describeActivity(e) {
     default: return escapeHtml(e.action) + ' ' + who;
   }
 }
+
+var lastActivityEvents = [];
 
 function renderActivity(data) {
   var people = Object.keys(data.summary).sort();
@@ -2468,11 +2522,14 @@ function renderActivity(data) {
            escapeHtml(name) + '</option>';
   }).join('');
 
-  document.getElementById('activity-list').innerHTML = data.events.map(function (e) {
+  lastActivityEvents = data.events;
+  document.getElementById('activity-list').innerHTML = data.events.map(function (e, i) {
     var when = new Date(e.ts * 1000).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric',
                                                           hour: 'numeric', minute: '2-digit' });
     return '<div class="activity-row' + (e.ok ? '' : ' failed') + '"><div>' + escapeHtml(e.actor) + ': ' +
-           describeActivity(e) + (e.ok ? '' : ' &ndash; failed: ' + escapeHtml(e.detail || '')) + '</div>' +
+           describeActivity(e) + (e.ok ? '' : ' &ndash; failed' + (e.action === 'schedule_set' ? '' : ': ' + escapeHtml(e.detail || ''))) +
+           (e.ok && e.action === 'schedule_set' ? ' <button class="activity-undo" data-undo-schedule="' + i + '">Undo</button>' : '') +
+           '</div>' +
            '<div class="when">' + when + '</div></div>';
   }).join('');
 }
@@ -2517,6 +2574,79 @@ function guestUrl(token) {
 }
 
 
+var DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+var schedEdit = null; // { profileId, name, days: [[ [start, end], ... ] x7], adding: dayIndex or null }
+
+function minuteLabel(m) {
+  if (m === 1440) return 'midnight';
+  var h = Math.floor(m / 60), mm = m % 60;
+  return ((h + 11) % 12 + 1) + ':' + (mm < 10 ? '0' : '') + mm + ' ' + (h < 12 ? 'AM' : 'PM');
+}
+
+function timeOptions(from, to, selected) {
+  var out = '';
+  for (var m = from; m <= to; m += 15) {
+    out += '<option value="' + m + '"' + (m === selected ? ' selected' : '') + '>' + minuteLabel(m) + '</option>';
+  }
+  return out;
+}
+
+function renderSchedule() {
+  document.getElementById('sched-title').textContent = 'Schedule: ' + schedEdit.name;
+  document.getElementById('sched-days').innerHTML = schedEdit.days.map(function (windows, d) {
+    var chips = windows.length ? windows.map(function (w, i) {
+      return '<span class="sched-chip">' + minuteLabel(w[0]) + ' &ndash; ' + minuteLabel(w[1]) +
+             '<button data-sched-remove="' + d + ',' + i + '" aria-label="Remove">&times;</button></span>';
+    }).join('') : '<div class="sched-none">Blocked all day</div>';
+    var adding = schedEdit.adding === d
+      ? '<div class="sched-add"><select id="sched-add-start">' + timeOptions(0, 1425, 420) + '</select>' +
+        '<span>to</span><select id="sched-add-end">' + timeOptions(15, 1440, 1260) + '</select>' +
+        '<button data-sched-add-confirm="' + d + '">Add</button>' +
+        '<button class="modal-cancel-btn" data-sched-add-cancel="1">Cancel</button></div>'
+      : '';
+    return '<div class="sched-day"><div class="sched-day-head"><span class="sched-day-name">' + DAY_NAMES[d] + '</span>' +
+           '<span class="sched-links"><button data-sched-add="' + d + '">+ Add</button>' +
+           '<button data-sched-copy="' + d + '">Copy to all days</button></span></div>' + chips + adding + '</div>';
+  }).join('');
+}
+
+function openScheduleEditor(profileId) {
+  var p = lastProfiles.filter(function (x) { return String(x.id) === String(profileId); })[0];
+  fetch('/api/schedule?token=' + encodeURIComponent(TOKEN) + '&profile_id=' + profileId)
+    .then(parseResponse)
+    .then(function (data) {
+      schedEdit = { profileId: profileId, name: p ? p.name : 'profile', days: data.days, adding: null };
+      renderSchedule();
+      document.getElementById('sched-backdrop').classList.add('open');
+    })
+    .catch(function (err) { toast(err.message || 'Failed - check connection'); });
+}
+
+function closeScheduleEditor() {
+  document.getElementById('sched-backdrop').classList.remove('open');
+  schedEdit = null;
+}
+
+function saveSchedule(profileId, days, confirmed, doneMessage) {
+  return fetch('/api/schedule/set?token=' + encodeURIComponent(TOKEN) + '&profile_id=' + profileId +
+               '&days=' + encodeURIComponent(JSON.stringify(days)) + (confirmed ? '&confirm=1' : '') +
+               '&request_id=' + newRequestId(), { method: 'POST' })
+    .then(function (r) {
+      if (r.ok) return r.json();
+      return r.json().then(function (body) {
+        if (body.needs_confirm && !confirmed &&
+            confirm(body.error + '. Save it anyway? The profile will have no internet at all except reward time.')) {
+          return saveSchedule(profileId, days, true, doneMessage);
+        }
+        throw new Error(body.needs_confirm ? 'Not saved' : (body.error || 'Failed (HTTP ' + r.status + ')'));
+      });
+    })
+    .then(function (result) {
+      if (result && result.ok) { toast(doneMessage); loadProfiles(); loadActivity(); }
+      return result;
+    });
+}
+
 // Sends a per-profile action, showing its progress in the card like the
 // reward buttons do.
 function sendProfileAction(profileId, path, extraParams, doneMessage) {
@@ -2535,6 +2665,61 @@ function sendProfileAction(profileId, path, extraParams, doneMessage) {
 }
 
 document.addEventListener('click', function (e) {
+  var editSchedBtn = e.target.closest('button[data-edit-schedule]');
+  if (editSchedBtn) { openScheduleEditor(editSchedBtn.dataset.editSchedule); return; }
+  if (schedEdit) {
+    var t = e.target.closest('button');
+    if (t && t.id === 'sched-cancel-btn') { closeScheduleEditor(); return; }
+    if (t && t.id === 'sched-save-btn') {
+      setBusy(t, true);
+      saveSchedule(schedEdit.profileId, schedEdit.days, false, 'Schedule saved')
+        .then(function (result) { if (result && result.ok) closeScheduleEditor(); })
+        .catch(function (err) { toast(err.message || 'Failed - check connection'); })
+        .finally(function () { setBusy(t, false); });
+      return;
+    }
+    if (t && t.dataset.schedAdd !== undefined) { schedEdit.adding = Number(t.dataset.schedAdd); renderSchedule(); return; }
+    if (t && t.dataset.schedAddCancel !== undefined) { schedEdit.adding = null; renderSchedule(); return; }
+    if (t && t.dataset.schedAddConfirm !== undefined) {
+      var d = Number(t.dataset.schedAddConfirm);
+      var start = Number(document.getElementById('sched-add-start').value);
+      var end = Number(document.getElementById('sched-add-end').value);
+      if (end <= start) { toast('The end has to be after the start'); return; }
+      // Merge with any overlapping or touching windows that day.
+      var merged = [], cur = [start, end];
+      schedEdit.days[d].concat([cur]).sort(function (a, b) { return a[0] - b[0]; }).forEach(function (w) {
+        var last = merged[merged.length - 1];
+        if (last && w[0] <= last[1]) { last[1] = Math.max(last[1], w[1]); } else { merged.push([w[0], w[1]]); }
+      });
+      schedEdit.days[d] = merged;
+      schedEdit.adding = null;
+      renderSchedule();
+      return;
+    }
+    if (t && t.dataset.schedRemove !== undefined) {
+      var parts = t.dataset.schedRemove.split(',');
+      schedEdit.days[Number(parts[0])].splice(Number(parts[1]), 1);
+      renderSchedule();
+      return;
+    }
+    if (t && t.dataset.schedCopy !== undefined) {
+      var src = schedEdit.days[Number(t.dataset.schedCopy)];
+      schedEdit.days = schedEdit.days.map(function () { return src.map(function (w) { return [w[0], w[1]]; }); });
+      renderSchedule();
+      return;
+    }
+  }
+  var undoBtn = e.target.closest('button[data-undo-schedule]');
+  if (undoBtn) {
+    var ev = lastActivityEvents[Number(undoBtn.dataset.undoSchedule)];
+    if (!confirm('Put ' + ev.profile + "'s schedule back the way it was before this change?")) return;
+    undoBtn.disabled = true;
+    saveSchedule(ev.profile_id, JSON.parse(ev.detail).before, false, 'Schedule restored')
+      .catch(function (err) { toast(err.message || 'Failed - check connection'); })
+      .finally(function () { undoBtn.disabled = false; });
+    return;
+  }
+
   var pauseBtn = e.target.closest('button[data-pause-id]');
   if (pauseBtn) {
     sendProfileAction(pauseBtn.dataset.pauseId, '/api/pause',
@@ -2904,6 +3089,18 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._send_json(status)
             return
 
+        if parsed.path == '/api/schedule':
+            if not is_admin_token(self._supplied_token(qs)):
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            try:
+                profile_id = int(qs['profile_id'][0])
+            except (KeyError, ValueError):
+                self._send_json({'error': 'bad request'}, status=400)
+                return
+            self._send_json({'days': get_on_windows(profile_id)})
+            return
+
         if parsed.path == '/api/activity':
             if not is_admin_token(self._supplied_token(qs)):
                 self._send_json({'error': 'forbidden'}, status=403)
@@ -3005,6 +3202,36 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send_json({'error': str(exc)}, status=500)
                 return
             record_activity(actor, 'revoke', profile_id, minutes=removed)
+            self._send_json({'ok': True})
+            return
+
+        if parsed.path == '/api/schedule/set':
+            actor = get_actor(self._supplied_token(qs))
+            if not actor or actor['kind'] != 'admin':
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            try:
+                profile_id = int(qs['profile_id'][0])
+                days = json.loads(qs['days'][0])
+                validate_on_windows(days)
+            except (KeyError, ValueError) as exc:
+                self._send_json({'error': 'Invalid schedule: %s' % exc}, status=400)
+                return
+            if not any(days) and qs.get('confirm', [''])[0] != '1':
+                self._send_json({'error': 'This schedule never allows internet', 'needs_confirm': True},
+                                status=400)
+                return
+            before = get_on_windows(profile_id)
+            detail = json.dumps({'before': before, 'after': days})
+            try:
+                set_schedule(profile_id, days, self._request_id(qs))
+            except Exception as exc:
+                log.exception('set_schedule failed for profile_id=%s', profile_id)
+                record_activity(actor, 'schedule_set', profile_id, ok=False,
+                                detail=json.dumps({'before': before, 'after': days, 'error': str(exc)}))
+                self._send_json({'error': str(exc)}, status=500)
+                return
+            record_activity(actor, 'schedule_set', profile_id, detail=detail)
             self._send_json({'ok': True})
             return
 
