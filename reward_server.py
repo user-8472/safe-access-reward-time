@@ -88,6 +88,10 @@ def get_tokens_db():
     # Babysitter links can be limited to some profiles: a JSON list of profile
     # ids, or NULL for all of them (the default, and every link made before
     # this column existed).
+    # Opt-in to monitor.py's Sunday usage summary (needs an alert email too).
+    admin_columns = [row[1] for row in conn.execute("PRAGMA table_info(admin_tokens)")]
+    if 'weekly' not in admin_columns:
+        conn.execute("ALTER TABLE admin_tokens ADD COLUMN weekly INTEGER NOT NULL DEFAULT 0")
     guest_columns = [row[1] for row in conn.execute("PRAGMA table_info(guest_tokens)")]
     if 'profile_ids' not in guest_columns:
         conn.execute("ALTER TABLE guest_tokens ADD COLUMN profile_ids TEXT")
@@ -133,9 +137,10 @@ def list_admin_tokens():
     conn = get_tokens_db()
     try:
         rows = conn.execute(
-            "SELECT token, label, email FROM admin_tokens ORDER BY created_at"
+            "SELECT token, label, email, weekly FROM admin_tokens ORDER BY created_at"
         ).fetchall()
-        return [{'token': t, 'label': label, 'email': email or ''} for t, label, email in rows]
+        return [{'token': t, 'label': label, 'email': email or '', 'weekly': bool(weekly)}
+                for t, label, email, weekly in rows]
     finally:
         conn.close()
 
@@ -158,6 +163,15 @@ def set_admin_email(token, email):
     conn = get_tokens_db()
     try:
         conn.execute("UPDATE admin_tokens SET email = ? WHERE token = ?", (email or None, token))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_admin_weekly(token, weekly):
+    conn = get_tokens_db()
+    try:
+        conn.execute("UPDATE admin_tokens SET weekly = ? WHERE token = ?", (1 if weekly else 0, token))
         conn.commit()
     finally:
         conn.close()
@@ -1729,6 +1743,9 @@ PAGE_TEMPLATE = """<!doctype html>
   .section-head .fold { color: #9b9ba1; font-size: 15px; transition: transform 0.15s; }
   .section-head.folded .fold { transform: rotate(-90deg); }
   .section-body.folded { display: none; }
+  .weekly-opt { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 14px; color: #b8b8bd; }
+  .weekly-opt input { width: 18px; height: 18px; }
+  .weekly-opt.disabled { color: #6e6e73; }
   .row-revoke { display: block; width: 100%; margin-top: 10px; padding: 10px 0; font-size: 14px; }
   .activity-undo { background: none; color: #0a84ff; width: auto; padding: 2px 0; font-size: 13px; }
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -2592,6 +2609,9 @@ function renderAdminLinks(admins) {
            '<div class="admin-email-row"><input class="guest-url-field" type="email" placeholder="Alert email (optional)" ' +
            'data-admin-email="' + a.token + '" value="' + escapeHtml(email) + '">' +
            '<button class="copy-guest" data-save-admin-email="' + a.token + '">Save</button></div>' +
+           '<label class="weekly-opt' + (a.email ? '' : ' disabled') + '"><input type="checkbox" data-weekly-admin="' + a.token + '"' +
+           (a.weekly ? ' checked' : '') + (a.email ? '' : ' disabled') + '>Weekly usage email (Sundays)' +
+           (a.email ? '' : ' &ndash; needs an alert email') + '</label>' +
            (a.is_me ? '' : '<button class="revoke-guest row-revoke" data-revoke-admin="' + a.token + '">Revoke</button>') +
            '</div>' +
            '</div>';
@@ -2676,6 +2696,7 @@ function describeActivity(e) {
     case 'admin_link_created': return 'created admin link ' + escapeHtml(e.detail || '');
     case 'admin_link_revoked': return 'revoked admin link ' + escapeHtml(e.detail || '');
     case 'admin_alert_email_set': return 'alert email for ' + escapeHtml(e.detail || '');
+    case 'admin_weekly_email_set': return 'weekly email for ' + escapeHtml(e.detail || '');
     default: return escapeHtml(e.action) + ' ' + who;
   }
 }
@@ -2729,6 +2750,13 @@ function loadActivity() {
 
 document.addEventListener('change', function (e) {
   if (e.target.id === 'activity-filter') loadActivity();
+  if (e.target.dataset && e.target.dataset.weeklyAdmin) {
+    var box = e.target;
+    adminPost('/api/admins/set_weekly', { admin_token: box.dataset.weeklyAdmin, weekly: box.checked ? '1' : '0' })
+      .then(function () { toast(box.checked ? 'Weekly email on' : 'Weekly email off'); loadAdminLinks(); loadActivity(); })
+      .catch(function (err) { box.checked = !box.checked; toast(err.message || 'Failed - check connection'); });
+    return;
+  }
   if (e.target.id === 'scope-all') {
     document.getElementById('scope-list').style.display = e.target.checked ? 'none' : '';
   }
@@ -3593,7 +3621,8 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._send_json({'ok': True, 'token': new_token})
             return
 
-        if parsed.path in ('/api/admins/create', '/api/admins/set_email', '/api/admins/revoke'):
+        if parsed.path in ('/api/admins/create', '/api/admins/set_email', '/api/admins/set_weekly',
+                           '/api/admins/revoke'):
             me = self._supplied_token(qs)
             if not is_admin_token(me):
                 self._send_json({'error': 'forbidden'}, status=403)
@@ -3616,7 +3645,12 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send_json({'error': 'bad request'}, status=400)
                 return
             target_label = ([a['label'] for a in list_admin_tokens() if a['token'] == target] or ['?'])[0]
-            if parsed.path == '/api/admins/set_email':
+            if parsed.path == '/api/admins/set_weekly':
+                weekly = qs.get('weekly', [''])[0] == '1'
+                set_admin_weekly(target, weekly)
+                record_activity(get_actor(me), 'admin_weekly_email_set',
+                                detail='%s: %s' % (target_label, 'on' if weekly else 'off'))
+            elif parsed.path == '/api/admins/set_email':
                 set_admin_email(target, email)
                 record_activity(get_actor(me), 'admin_alert_email_set',
                                 detail='%s: %s' % (target_label, email or 'alerts off'))

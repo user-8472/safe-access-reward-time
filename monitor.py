@@ -5,7 +5,9 @@
 #
 # Raises one alert when a check starts failing and one when it recovers,
 # rather than repeating every minute, and also reports one-off events (a
-# forced DDNS update, a matching line in a watched log). Alerts are always
+# forced DDNS update, a matching line in a watched log, an action in the app's
+# activity log that failed). It also sends the weekly usage summary (Sundays
+# from WEEKLY_HOUR) to admin links that opted in. Alerts are always
 # written to monitor.log and, when email is configured (see send_email), to
 # every admin link that has an alert email. Alerts that couldn't be emailed
 # stay queued and are retried on the next run. The current set of problems
@@ -38,6 +40,8 @@ TOKENS_DB_PATH = os.path.join(APP_DIR, 'tokens.db')
 HEARTBEAT_MAX_AGE = 120
 WEB_FAILS_BEFORE_ALERT = 3  # watchdog.sh restarts it within a minute; only a lasting outage alerts
 MAX_QUEUED_ALERTS = 200
+WEEKLY_WEEKDAY = 6   # Sunday (time.localtime: Monday = 0)
+WEEKLY_HOUR = 18
 
 with open(os.path.join(APP_DIR, 'config.json')) as f:
     CONFIG = json.load(f)
@@ -131,6 +135,34 @@ def check_log_watch(name, path, pattern, state):
     return events
 
 
+def check_failed_actions(state):
+    # Each activity row with ok=0 since the last run becomes one event. On the
+    # first run, start from the newest row so old failures aren't re-sent.
+    try:
+        conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
+        try:
+            newest = conn.execute("SELECT MAX(id) FROM activity").fetchone()[0] or 0
+            last = state.get('last_activity_id')
+            rows = [] if last is None else conn.execute(
+                "SELECT ts, actor, action, profile_name, detail FROM activity "
+                "WHERE ok = 0 AND id > ? ORDER BY id", (last,)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    state['last_activity_id'] = newest
+    events = []
+    for ts, actor, action, profile, detail in rows:
+        try:
+            detail = json.loads(detail).get('error', detail)  # schedule changes store JSON
+        except (TypeError, ValueError, AttributeError):
+            pass
+        events.append('failed action: %s %s%s at %s - %s' % (
+            actor, action, ' for ' + profile if profile else '',
+            time.strftime('%H:%M', time.localtime(ts)), detail or 'no detail'))
+    return events
+
+
 def run_checks(state):
     # Returns ({check name: problem text}, [event texts]).
     monitor_cfg = CONFIG.get('monitor', {})
@@ -163,16 +195,21 @@ def run_checks(state):
     for name, spec in sorted(monitor_cfg.get('log_watches', {}).items()):
         events.extend(check_log_watch(name, spec['path'], spec['pattern'], state))
 
+    events.extend(check_failed_actions(state))
+
     return problems, events
 
 
-def alert_recipients():
-    # Admin links with an alert email (managed on the app's admin page).
+def alert_recipients(weekly=False):
+    # Admin links with an alert email (managed on the app's admin page); for
+    # the weekly summary, only those that also ticked "Weekly usage email".
+    query = "SELECT email FROM admin_tokens WHERE email IS NOT NULL AND email != ''"
+    if weekly:
+        query += " AND weekly = 1"
     try:
         conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
         try:
-            rows = conn.execute(
-                "SELECT email FROM admin_tokens WHERE email IS NOT NULL AND email != ''").fetchall()
+            rows = conn.execute(query).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
@@ -193,15 +230,19 @@ class VerifiedSMTP_SSL(smtplib.SMTP_SSL):
 
 
 def send_email(recipients, alerts):
+    host = socket.gethostname()
+    subject = 'Reward Time on %s: %s' % (host, alerts[0][1] if len(alerts) == 1 else '%d alerts' % len(alerts))
+    body = '\n'.join('%s  %s' % (time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)), text)
+                     for ts, text in alerts)
+    return send_mail(recipients, subject, body)
+
+
+def send_mail(recipients, subject, body):
     # config.json "smtp": {"host": "smtp.gmail.com", "port": 465,
     #                      "user": "...", "password": "<app password>"}
     smtp = CONFIG.get('smtp')
     if not smtp or not recipients:
         return False
-    host = socket.gethostname()
-    subject = 'Reward Time on %s: %s' % (host, alerts[0][1] if len(alerts) == 1 else '%d alerts' % len(alerts))
-    body = '\n'.join('%s  %s' % (time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)), text)
-                     for ts, text in alerts)
     msg = MIMEText(body + '\n')
     msg['Subject'] = subject
     msg['From'] = smtp.get('from', smtp['user'])
@@ -213,6 +254,86 @@ def send_email(recipients, alerts):
     finally:
         server.quit()
     return True
+
+
+def minutes_text(m):
+    hours, mins = divmod(int(m), 60)
+    parts = []
+    if hours:
+        parts.append('%d hr%s' % (hours, '' if hours == 1 else 's'))
+    if mins or not parts:
+        parts.append('%d min' % mins)
+    return ' '.join(parts)
+
+
+def weekly_report(now):
+    # (subject, body) for the 7 days up to now: who did what, and usage.
+    since = now - 7 * 86400
+    period = '%s - %s' % (time.strftime('%b %d', time.localtime(since)), time.strftime('%b %d', time.localtime(now)))
+    lines = ['Reward Time, week of %s' % period, '']
+
+    conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
+    try:
+        people = conn.execute(
+            "SELECT actor, actor_kind, "
+            "SUM(action IN ('grant', 'set_until') AND ok = 1), "
+            "SUM(CASE WHEN action IN ('grant', 'set_until') AND ok = 1 AND minutes > 0 THEN minutes ELSE 0 END), "
+            "SUM(action = 'revoke' AND ok = 1), SUM(action = 'pause' AND ok = 1), "
+            "SUM(action = 'schedule_set' AND ok = 1), SUM(ok = 0) "
+            "FROM activity WHERE ts >= ? GROUP BY actor ORDER BY actor", (since,)).fetchall()
+    finally:
+        conn.close()
+    lines.append('Who did what')
+    if not people:
+        lines.append('  Nothing this week.')
+    for actor, kind, grants, minutes, revokes, pauses, schedules, failed in people:
+        parts = []
+        if grants:
+            parts.append('%d reward grant%s, %s' % (grants, '' if grants == 1 else 's', minutes_text(minutes)))
+        if revokes:
+            parts.append('%d revoke%s' % (revokes, '' if revokes == 1 else 's'))
+        if pauses:
+            parts.append('%d pause%s' % (pauses, '' if pauses == 1 else 's'))
+        if schedules:
+            parts.append('%d schedule change%s' % (schedules, '' if schedules == 1 else 's'))
+        if failed:
+            parts.append('%d FAILED' % failed)
+        lines.append('  %s%s: %s' % (actor, ' (babysitter)' if kind == 'guest' else '',
+                                     '; '.join(parts) or 'link changes only'))
+
+    sa = sqlite3.connect(CONFIG['db_path'], timeout=10)
+    try:
+        usage = sa.execute(
+            "SELECT profile.name, SUM(t.normal_spent) + SUM(t.reward_spent), SUM(t.reward_spent) "
+            "FROM profile JOIN config_group ON config_group.profile_id = profile.id "
+            "LEFT JOIN config_group_hour_timespent t ON t.parent_id = config_group.id AND t.timestamp >= ? "
+            "WHERE profile.visible = 1 AND profile.enable_blocktime = 1 AND profile.name NOT LIKE '$%' "
+            "GROUP BY profile.id ORDER BY profile.name", (since,)).fetchall()
+    finally:
+        sa.close()
+    lines += ['', 'Internet use (total, of which reward time)']
+    for name, total, reward in usage:
+        lines.append('  %s: %s%s' % (name, minutes_text(total or 0),
+                                     ', %s reward' % minutes_text(reward) if reward else ''))
+    lines += ['', 'Sent by the Reward Time app. Turn this off under Admin Access on the app page.']
+    return 'Reward Time weekly summary: %s' % period, '\n'.join(lines)
+
+
+def maybe_send_weekly(state, now):
+    lt = time.localtime(now)
+    week = time.strftime('%Y-%W', lt)
+    if lt.tm_wday != WEEKLY_WEEKDAY or lt.tm_hour < WEEKLY_HOUR or state.get('weekly_sent') == week:
+        return
+    recipients = alert_recipients(weekly=True)
+    if recipients:
+        try:
+            subject, body = weekly_report(now)
+            send_mail(recipients, subject, body)
+            log.info('weekly summary sent to %s', ', '.join(recipients))
+        except Exception as exc:
+            log.info('could not send weekly summary (will retry): %s', exc)
+            return
+    state['weekly_sent'] = week
 
 
 def main():
@@ -241,6 +362,7 @@ def main():
         except Exception as exc:
             log.info('could not send alert email (will retry): %s', exc)
     state['queue'] = queue[-MAX_QUEUED_ALERTS:]
+    maybe_send_weekly(state, now)
     state['last_run'] = now
     save_state(state)
 
@@ -261,4 +383,14 @@ def test_email():
 if __name__ == '__main__':
     if sys.argv[1:] == ['--test-email']:
         sys.exit(test_email())
+    if sys.argv[1:] == ['--weekly-preview']:
+        print('\n\n'.join(weekly_report(int(time.time()))))
+        sys.exit(0)
+    if sys.argv[1:] == ['--weekly-now']:
+        recipients = alert_recipients(weekly=True)
+        if not recipients:
+            sys.exit('No admin link has both an alert email and "Weekly usage email" ticked.')
+        send_mail(recipients, *weekly_report(int(time.time())))
+        print('Sent the weekly summary to: %s' % ', '.join(recipients))
+        sys.exit(0)
     main()
