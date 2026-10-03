@@ -10,3 +10,7 @@ pending/
 # Python bytecode (e.g. from running the tests locally)
 __pycache__/
 *.pyc
+
+# deploy.sh backups and staging (when the app runs from this checkout)
+backups/
+.deploy-*/

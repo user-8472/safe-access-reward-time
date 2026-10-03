@@ -1651,6 +1651,8 @@ PAGE_TEMPLATE = """<!doctype html>
   .revoke:active { background: rgba(255, 69, 58, 0.15); }
   .card.collapsed .custom-btn { display: none; }
   .btns .custom-btn { grid-column: span 2; background: #2c2c2e; font-size: 15px; }
+  .btns .quarter, .btns .revoke.quarter { grid-column: span 1; }
+  .btns .resume-btn { background: #1d3a24; color: #4cd964; font-size: 15px; }
   .btns .custom-btn.wide { grid-column: 1 / -1; }
   .btns .pause-btn { background: #3a2a10; color: #ffb340; font-size: 15px; }
   /* two bars drawn in the text colour - the Unicode pause symbol shows as a coloured emoji on some phones */
@@ -1721,6 +1723,9 @@ PAGE_TEMPLATE = """<!doctype html>
   .sched-none { color: #9b9ba1; font-size: 14px; margin-top: 4px; }
   .btns .sched-btn { grid-column: span 2; background: #2c2c2e; font-size: 15px; }
   .section-head { display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+  .count-badge { display: inline-block; min-width: 1.4em; padding: 1px 7px; margin-left: 6px; border-radius: 999px;
+                 background: #2c2c2e; color: #b8b8bd; font-size: 0.75em; text-align: center; vertical-align: 2px; }
+  .count-badge.active { background: #0a84ff; color: #fff; }
   .section-head .fold { color: #9b9ba1; font-size: 15px; transition: transform 0.15s; }
   .section-head.folded .fold { transform: rotate(-90deg); }
   .section-body.folded { display: none; }
@@ -1785,7 +1790,7 @@ PAGE_TEMPLATE = """<!doctype html>
     .add-token-body { margin-top: 10px; }
     .btns { gap: 7px; }
     .btns button { padding: 11px 0; font-size: 15px; }
-    .btns .revoke, .btns .custom-btn, .btns .pause-btn, .btns .sched-btn { font-size: 13px; }
+    .btns .revoke, .btns .custom-btn, .btns .pause-btn, .btns .sched-btn, .btns .resume-btn { font-size: 13px; }
     button { padding: 11px 0; border-radius: 8px; font-size: 15px; }
     .modal-title { font-size: 16px; margin-bottom: 10px; }
     .spinner { width: 13px; height: 13px; margin-left: 5px; }
@@ -1846,7 +1851,7 @@ PAGE_TEMPLATE = """<!doctype html>
 <div class="health-banner" id="health-banner" style="display:none"></div>
 <div id="cards"></div>
 <div id="admin-section" style="display:none">
-  <h2 class="section-head" data-section="babysitter">Babysitter Access<span class="fold">&#9662;</span></h2>
+  <h2 class="section-head" data-section="babysitter"><span>Babysitter Access <span class="count-badge" id="guest-count">0</span></span><span class="fold">&#9662;</span></h2>
   <div class="section-body" data-section-body="babysitter">
     <div id="guest-tokens-list"></div>
     <div class="card" id="add-token-card">
@@ -1908,7 +1913,7 @@ PAGE_TEMPLATE = """<!doctype html>
       <button type="button" class="date-toggle-btn" id="win-apply-toggle">Apply to&hellip;</button>
       <div id="win-days-wrap" style="display:none">
         <div class="win-days" id="win-days"></div>
-        <div class="win-note">Other selected days get their times replaced with this one.</div>
+        <div class="win-note">Added to the other selected days; overlapping times there merge.</div>
       </div>
     </div>
     <div class="modal-actions">
@@ -2152,7 +2157,7 @@ function saveWindow() {
       var others = schedEdit.days[d].filter(function (w, i) { return i !== c.index; });
       schedEdit.days[d] = mergeWindows(others.concat([win]));
     } else {
-      schedEdit.days[d] = [[win[0], win[1]]];  // "Apply to" replaces that day's times
+      schedEdit.days[d] = mergeWindows(schedEdit.days[d].concat([win]));  // "Apply to" adds (union)
     }
   });
   closePicker();
@@ -2448,7 +2453,9 @@ function render(profiles) {
     var btns = PRESETS.map(function (m) {
       return '<button data-id="' + p.id + '" data-minutes="' + m + '">+' + m + 'm</button>';
     }).join('');
-    var revokeBtnHtml = '<button class="revoke" data-revoke-id="' + p.id + '">Revoke</button>';
+    // While paused, Resume and Revoke share the last half of the row.
+    var revokeBtnHtml = (p.paused ? '<button class="resume-btn quarter" data-unpause-id="' + p.id + '">Resume</button>' : '') +
+      '<button class="revoke' + (p.paused ? ' quarter' : '') + '" data-revoke-id="' + p.id + '">Revoke</button>';
     var PAUSE_ICON = '<span class="pause-icon"></span>';
     var moveBtns = '<div class="move-btns">' +
       '<button class="move" data-move-id="' + p.id + '" data-dir="up"' + (idx === 0 ? ' disabled' : '') + '>&#9650;</button>' +
@@ -2514,6 +2521,10 @@ var expandedGuestTokens = {};
 
 function renderGuestTokens(tokens) {
   lastGuestTokens = tokens;
+  var badge = document.getElementById('guest-count');
+  badge.textContent = tokens.length;
+  badge.classList.toggle('active', tokens.length > 0);
+  badge.title = tokens.length + ' active babysitter link' + (tokens.length === 1 ? '' : 's');
   var el = document.getElementById('guest-tokens-list');
   if (!tokens.length) { el.innerHTML = ''; return; }
   el.innerHTML = tokens.map(function (t) {
@@ -2901,6 +2912,11 @@ document.addEventListener('click', function (e) {
   if (pauseBtn) {
     sendProfileAction(pauseBtn.dataset.pauseId, '/api/pause',
                       '&minutes=' + pauseBtn.dataset.pauseMinutes, 'Pause +' + pauseBtn.dataset.pauseMinutes + ' min');
+    return;
+  }
+  var unpauseBtn = e.target.closest('button[data-unpause-id]');
+  if (unpauseBtn) {
+    sendProfileAction(unpauseBtn.dataset.unpauseId, '/api/unpause', '', 'Internet resumed');
     return;
   }
   var pausePickerBtn = e.target.closest('button[data-open-pause-picker]');
