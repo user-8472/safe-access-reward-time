@@ -73,6 +73,21 @@ def get_tokens_db():
         "token TEXT PRIMARY KEY, label TEXT NOT NULL, email TEXT, "
         "created_at INTEGER NOT NULL)"
     )
+    # Babysitter links can be limited to some profiles: a JSON list of profile
+    # ids, or NULL for all of them (the default, and every link made before
+    # this column existed).
+    guest_columns = [row[1] for row in conn.execute("PRAGMA table_info(guest_tokens)")]
+    if 'profile_ids' not in guest_columns:
+        conn.execute("ALTER TABLE guest_tokens ADD COLUMN profile_ids TEXT")
+    # Who did what: one row per action, kept for ACTIVITY_KEEP_DAYS. minutes is
+    # the reward time actually added (negative when shortened or revoked).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS activity ("
+        "id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor TEXT NOT NULL, "
+        "actor_kind TEXT NOT NULL, action TEXT NOT NULL, profile_id INTEGER, "
+        "profile_name TEXT, minutes INTEGER, until INTEGER, ok INTEGER NOT NULL, detail TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS activity_ts ON activity (ts)")
     if conn.execute("SELECT COUNT(*) FROM admin_tokens").fetchone()[0] == 0:
         conn.execute(
             "INSERT INTO admin_tokens (token, label, email, created_at) VALUES (?, ?, NULL, ?)",
@@ -163,20 +178,91 @@ def get_health():
     return problems
 
 
-def is_token_valid(supplied):
+def get_actor(supplied):
+    # Who a token belongs to: {'kind': 'admin'|'guest', 'label', 'profile_ids'}
+    # (profile_ids is None for "all profiles"), or None if it isn't valid.
+    admin = get_admin(supplied)
+    if admin:
+        return {'kind': 'admin', 'label': admin['label'], 'profile_ids': None}
     if not supplied:
-        return False
-    if is_admin_token(supplied):
-        return True
+        return None
     conn = get_tokens_db()
     try:
         row = conn.execute(
-            "SELECT 1 FROM guest_tokens WHERE token = ? AND expires_at > ?",
+            "SELECT label, profile_ids FROM guest_tokens WHERE token = ? AND expires_at > ?",
             (supplied, int(time.time()))
         ).fetchone()
-        return row is not None
     finally:
         conn.close()
+    if row is None:
+        return None
+    return {'kind': 'guest', 'label': row[0],
+            'profile_ids': json.loads(row[1]) if row[1] else None}
+
+
+def can_change(actor, profile_id):
+    return actor['profile_ids'] is None or profile_id in actor['profile_ids']
+
+
+def is_token_valid(supplied):
+    return get_actor(supplied) is not None
+
+
+ACTIVITY_KEEP_DAYS = 365
+
+
+def record_activity(actor, action, profile_id=None, minutes=None, until=None, ok=True, detail=None):
+    # Never lets a logging problem break the action itself.
+    try:
+        profile_name = None
+        if profile_id is not None:
+            profile_name = profile_reward_state(profile_id)[0]
+        now = int(time.time())
+        conn = get_tokens_db()
+        try:
+            conn.execute(
+                "INSERT INTO activity (ts, actor, actor_kind, action, profile_id, profile_name, "
+                "minutes, until, ok, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now, actor['label'], actor['kind'], action, profile_id, profile_name,
+                 minutes, until, 1 if ok else 0, detail))
+            conn.execute("DELETE FROM activity WHERE ts < ?", (now - ACTIVITY_KEEP_DAYS * 86400,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        log.exception('could not record activity %s by %s', action, actor.get('label'))
+
+
+def list_activity(who=None, limit=100):
+    conn = get_tokens_db()
+    try:
+        query = ("SELECT ts, actor, actor_kind, action, profile_name, minutes, until, ok, detail "
+                 "FROM activity")
+        args = []
+        if who:
+            query += " WHERE actor = ?"
+            args.append(who)
+        query += " ORDER BY ts DESC, id DESC LIMIT ?"
+        args.append(limit)
+        rows = conn.execute(query, args).fetchall()
+        people = [r[0] for r in conn.execute(
+            "SELECT actor FROM activity GROUP BY actor ORDER BY MAX(ts) DESC").fetchall()]
+        now = int(time.time())
+        summary = {}
+        for period, days in (('week', 7), ('month', 30)):
+            for actor, actor_kind, grants, custom, revokes, minutes in conn.execute(
+                    "SELECT actor, actor_kind, "
+                    "SUM(action = 'grant'), SUM(action = 'set_until'), SUM(action = 'revoke'), "
+                    "SUM(CASE WHEN minutes > 0 THEN minutes ELSE 0 END) "
+                    "FROM activity WHERE ok = 1 AND ts >= ? GROUP BY actor", (now - days * 86400,)):
+                summary.setdefault(actor, {'kind': actor_kind})[period] = {
+                    'grants': grants or 0, 'custom': custom or 0,
+                    'revokes': revokes or 0, 'minutes': minutes or 0}
+    finally:
+        conn.close()
+    events = [{'ts': r[0], 'actor': r[1], 'actor_kind': r[2], 'action': r[3], 'profile': r[4],
+               'minutes': r[5], 'until': r[6], 'ok': bool(r[7]), 'detail': r[8]} for r in rows]
+    return {'events': events, 'people': people, 'summary': summary}
 
 
 def list_guest_tokens():
@@ -186,21 +272,23 @@ def list_guest_tokens():
         conn.execute("DELETE FROM guest_tokens WHERE expires_at <= ?", (now,))
         conn.commit()
         rows = conn.execute(
-            "SELECT token, label, expires_at FROM guest_tokens ORDER BY expires_at"
+            "SELECT token, label, expires_at, profile_ids FROM guest_tokens ORDER BY expires_at"
         ).fetchall()
-        return [{'token': t, 'label': label, 'expires_at': exp} for t, label, exp in rows]
+        return [{'token': t, 'label': label, 'expires_at': exp,
+                 'profile_ids': json.loads(ids) if ids else None} for t, label, exp, ids in rows]
     finally:
         conn.close()
 
 
-def create_guest_token(label, expires_at):
+def create_guest_token(label, expires_at, profile_ids=None):
     token = binascii.hexlify(os.urandom(24))
     now = int(time.time())
     conn = get_tokens_db()
     try:
         conn.execute(
-            "INSERT INTO guest_tokens (token, label, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token, label, now, expires_at)
+            "INSERT INTO guest_tokens (token, label, created_at, expires_at, profile_ids) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (token, label, now, expires_at, json.dumps(profile_ids) if profile_ids is not None else None)
         )
         conn.commit()
     finally:
@@ -209,12 +297,15 @@ def create_guest_token(label, expires_at):
 
 
 def revoke_guest_token(token):
+    # Returns the revoked link's label (None if it didn't exist).
     conn = get_tokens_db()
     try:
+        row = conn.execute("SELECT label FROM guest_tokens WHERE token = ?", (token,)).fetchone()
         conn.execute("DELETE FROM guest_tokens WHERE token = ?", (token,))
         conn.commit()
     finally:
         conn.close()
+    return row[0] if row else None
 
 
 def get_db():
@@ -223,6 +314,20 @@ def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute('PRAGMA busy_timeout = 10000')
     return conn
+
+
+def profile_reward_state(profile_id):
+    # (name, current reward expiry or None) - used to log how much time an
+    # action actually added or removed.
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT name FROM profile WHERE id = ?", (profile_id,)).fetchone()
+        expiry = conn.execute(
+            "SELECT MAX(expired) FROM ultra_reward WHERE config_group_id = ? AND expired > ?",
+            (profile_id, int(time.time()))).fetchone()[0]
+    finally:
+        conn.close()
+    return (row[0] if row else None), expiry
 
 
 def get_profiles():
@@ -1515,6 +1620,17 @@ PAGE_TEMPLATE = """<!doctype html>
   .admin-email-row input { flex: 1 1 auto; min-width: 0; }
   .admin-email-row button { flex: none; width: auto; padding: 8px 12px; font-size: 13px; }
   .add-admin-btn { width: 100%; margin-top: 8px; padding: 12px 0; font-size: 15px; }
+  .guest-scope { margin: 10px 0 2px; font-size: 14px; color: #b8b8bd; }
+  .guest-scope label { display: inline-flex; align-items: center; gap: 6px; margin: 0 14px 8px 0; }
+  .guest-scope input { width: 18px; height: 18px; }
+  .activity-summary { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 12px; }
+  .activity-summary th, .activity-summary td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #2c2c2e; }
+  .activity-summary th { color: #9b9ba1; font-weight: 600; }
+  .activity-filter { width: 100%; padding: 10px; font-size: 15px; border-radius: 8px; background: #2c2c2e;
+                     color: #eee; border: none; margin-bottom: 10px; }
+  .activity-row { padding: 8px 2px; border-bottom: 1px solid #2c2c2e; font-size: 14px; }
+  .activity-row .when { color: #9b9ba1; font-size: 12px; }
+  .activity-row.failed { color: #ff6b61; }
   .revoke-guest { background: transparent; border: 1px solid #ff453a; color: #ff453a; }
   .guest-label-input { width: 100%; box-sizing: border-box; padding: 14px; font-size: 16px;
                         border-radius: 10px; border: 1px solid #3a3a3c; background: #1c1c1e;
@@ -1611,9 +1727,14 @@ PAGE_TEMPLATE = """<!doctype html>
     <div class="card-head" data-card-id="-1"><div class="name">Add a token</div></div>
     <div class="add-token-body">
       <input class="guest-label-input" id="guest-label" placeholder="Who is this for? (e.g. Grandma)">
+      <div class="guest-scope" id="guest-scope"></div>
       <div class="guest-duration-btns" id="guest-duration-btns"></div>
     </div>
   </div>
+  <h2>Activity</h2>
+  <table class="activity-summary" id="activity-summary"></table>
+  <select class="activity-filter" id="activity-filter"><option value="">Everyone</option></select>
+  <div id="activity-list"></div>
 </div>
 <div class="toast" id="toast"></div>
 <div class="modal-backdrop" id="modal-backdrop">
@@ -1817,12 +1938,14 @@ function submitPicker() {
 
   var label = document.getElementById('guest-label').value.trim() || 'Guest';
   fetch('/api/tokens/create?token=' + encodeURIComponent(TOKEN) +
-        '&label=' + encodeURIComponent(label) + '&until=' + epoch, { method: 'POST' })
+        '&label=' + encodeURIComponent(label) + '&until=' + epoch + guestScopeParam(), { method: 'POST' })
     .then(parseResponse)
     .then(function (result) {
       copyText(guestUrl(result.token));
       document.getElementById('guest-label').value = '';
+      renderGuestScope(true);
       loadGuestTokens();
+      loadActivity();
     })
     .catch(function (err) { toast(err.message || 'Failed - check connection'); })
     .finally(function () {
@@ -2073,7 +2196,7 @@ function loadProfiles() {
       var section = document.getElementById('admin-section');
       section.style.display = isAdmin ? 'block' : 'none';
       renderHealth(isAdmin ? data.health : []);
-      if (isAdmin) loadAdminLinks();
+      if (isAdmin) { loadAdminLinks(); loadActivity(); renderGuestScope(false); }
       if (isAdmin) {
         renderDurationButtons();
         loadGuestTokens();
@@ -2106,7 +2229,7 @@ function renderGuestTokens(tokens) {
     return '<div class="guest-row' + (isCollapsed ? ' collapsed' : '') + '">' +
            '<div class="guest-row-head" data-guest-toggle="' + t.token + '">' +
            '<div><div class="label">' + escapeHtml(t.label) + '</div>' +
-           '<div class="expires">until ' + expiresStr + '</div></div>' +
+           '<div class="expires">until ' + expiresStr + scopeText(t.profile_ids) + '</div></div>' +
            '<div class="guest-row-btns">' +
            '<button class="copy-guest" data-copy-guest="' + t.token + '">Copy</button>' +
            '<button class="revoke-guest" data-revoke-guest="' + t.token + '">Revoke</button>' +
@@ -2181,6 +2304,97 @@ function adminPost(path, params) {
   }).join('');
   return fetch(path + '?token=' + encodeURIComponent(TOKEN) + query, { method: 'POST' }).then(parseResponse);
 }
+
+function profileName(id) {
+  var p = lastProfiles.filter(function (x) { return x.id === id; })[0];
+  return p ? p.name : 'profile ' + id;
+}
+
+function scopeText(profileIds) {
+  return profileIds ? ' &middot; ' + escapeHtml(profileIds.map(profileName).join(', ')) : '';
+}
+
+// Profile checkboxes on the "Add a token" card - all ticked by default, so a
+// babysitter link covers every profile unless something is unticked.
+function renderGuestScope(reset) {
+  var el = document.getElementById('guest-scope');
+  var ticked = {};
+  var boxes = el.querySelectorAll('input[data-scope-id]');
+  Array.prototype.forEach.call(boxes, function (b) { ticked[b.dataset.scopeId] = b.checked; });
+  el.innerHTML = 'Can change:<br>' + lastProfiles.map(function (p) {
+    var on = reset || !(String(p.id) in ticked) || ticked[p.id];
+    return '<label><input type="checkbox" data-scope-id="' + p.id + '"' + (on ? ' checked' : '') + '>' +
+           escapeHtml(p.name) + '</label>';
+  }).join('');
+}
+
+function guestScopeParam() {
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('#guest-scope input[data-scope-id]'));
+  var ticked = boxes.filter(function (b) { return b.checked; });
+  if (!boxes.length || ticked.length === boxes.length) return '';
+  return '&profile_ids=' + ticked.map(function (b) { return b.dataset.scopeId; }).join(',');
+}
+
+function describeActivity(e) {
+  var who = escapeHtml(e.profile || '');
+  var mins = function (m) { return formatRemaining(Math.abs(m)); };
+  switch (e.action) {
+    case 'grant': return '+' + mins(e.minutes) + ' for ' + who;
+    case 'set_until':
+      return who + ' until ' + formatUntil(e.until) +
+             (e.minutes ? ' (' + (e.minutes > 0 ? '+' : '-') + mins(e.minutes) + ')' : '');
+    case 'revoke': return 'revoked ' + who + (e.minutes ? ' (-' + mins(e.minutes) + ')' : '');
+    case 'guest_link_created': return 'created babysitter link ' + escapeHtml(e.detail || '');
+    case 'guest_link_revoked': return 'revoked babysitter link ' + escapeHtml(e.detail || '');
+    case 'admin_link_created': return 'created admin link ' + escapeHtml(e.detail || '');
+    case 'admin_link_revoked': return 'revoked admin link ' + escapeHtml(e.detail || '');
+    case 'admin_alert_email_set': return 'alert email for ' + escapeHtml(e.detail || '');
+    default: return escapeHtml(e.action) + ' ' + who;
+  }
+}
+
+function renderActivity(data) {
+  var people = Object.keys(data.summary).sort();
+  var cell = function (s) {
+    if (!s || !(s.grants + s.custom + s.revokes)) return '&ndash;';
+    return (s.grants + s.custom) + ' &middot; ' + formatRemaining(s.minutes) +
+           (s.revokes ? ' &middot; ' + s.revokes + ' revoked' : '');
+  };
+  document.getElementById('activity-summary').innerHTML = people.length
+    ? '<tr><th></th><th>Last 7 days</th><th>Last 30 days</th></tr>' + people.map(function (name) {
+        var s = data.summary[name];
+        return '<tr><td>' + escapeHtml(name) + (s.kind === 'guest' ? ' <span class="when">(babysitter)</span>' : '') +
+               '</td><td>' + cell(s.week) + '</td><td>' + cell(s.month) + '</td></tr>';
+      }).join('')
+    : '<tr><td>No activity yet</td></tr>';
+
+  var filter = document.getElementById('activity-filter');
+  var current = filter.value;
+  filter.innerHTML = '<option value="">Everyone</option>' + data.people.map(function (name) {
+    return '<option value="' + escapeHtml(name) + '"' + (name === current ? ' selected' : '') + '>' +
+           escapeHtml(name) + '</option>';
+  }).join('');
+
+  document.getElementById('activity-list').innerHTML = data.events.map(function (e) {
+    var when = new Date(e.ts * 1000).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric',
+                                                          hour: 'numeric', minute: '2-digit' });
+    return '<div class="activity-row' + (e.ok ? '' : ' failed') + '"><div>' + escapeHtml(e.actor) + ': ' +
+           describeActivity(e) + (e.ok ? '' : ' &ndash; failed: ' + escapeHtml(e.detail || '')) + '</div>' +
+           '<div class="when">' + when + '</div></div>';
+  }).join('');
+}
+
+function loadActivity() {
+  var who = document.getElementById('activity-filter').value;
+  fetch('/api/activity?token=' + encodeURIComponent(TOKEN) + '&limit=50' +
+        (who ? '&who=' + encodeURIComponent(who) : ''))
+    .then(function (r) { return r.json(); })
+    .then(renderActivity);
+}
+
+document.addEventListener('change', function (e) {
+  if (e.target.id === 'activity-filter') loadActivity();
+});
 
 function loadGuestTokens() {
   fetch('/api/tokens?token=' + encodeURIComponent(TOKEN))
@@ -2274,13 +2488,15 @@ document.addEventListener('click', function (e) {
     var label = document.getElementById('guest-label').value.trim() || 'Guest';
     setBusy(durationBtn, true);
     fetch('/api/tokens/create?token=' + encodeURIComponent(TOKEN) +
-          '&label=' + encodeURIComponent(label) + '&hours=' + durationBtn.dataset.guestHours,
+          '&label=' + encodeURIComponent(label) + '&hours=' + durationBtn.dataset.guestHours + guestScopeParam(),
           { method: 'POST' })
       .then(parseResponse)
       .then(function (result) {
         copyText(guestUrl(result.token));
         document.getElementById('guest-label').value = '';
+        renderGuestScope(true);
         loadGuestTokens();
+        loadActivity();
       })
       .catch(function (err) { toast(err.message || 'Failed - check connection'); })
       .finally(function () { setBusy(durationBtn, false); });
@@ -2550,12 +2766,26 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not self._token_ok(qs):
                 self._send_json({'error': 'forbidden'}, status=403)
                 return
+            actor = get_actor(self._supplied_token(qs))
             admin = get_admin(self._supplied_token(qs))
-            status = {'profiles': get_profiles(), 'is_admin': admin is not None}
+            profiles = [p for p in get_profiles() if can_change(actor, p['id'])]
+            status = {'profiles': profiles, 'is_admin': admin is not None}
             if admin:
                 status['me'] = admin['label']
                 status['health'] = get_health()
             self._send_json(status)
+            return
+
+        if parsed.path == '/api/activity':
+            if not is_admin_token(self._supplied_token(qs)):
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            who = qs.get('who', [''])[0] or None
+            try:
+                limit = max(1, min(int(qs.get('limit', ['100'])[0]), 1000))
+            except ValueError:
+                limit = 100
+            self._send_json(list_activity(who, limit))
             return
 
         if parsed.path == '/api/admins':
@@ -2596,7 +2826,8 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
         qs = urlparse.parse_qs(parsed.query)
 
         if parsed.path == '/api/grant':
-            if not self._token_ok(qs):
+            actor = get_actor(self._supplied_token(qs))
+            if not actor:
                 self._send_json({'error': 'forbidden'}, status=403)
                 return
             try:
@@ -2605,6 +2836,9 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 self._send_json({'error': 'bad request'}, status=400)
                 return
+            if not can_change(actor, profile_id):
+                self._send_json({'error': "This link can't change that profile"}, status=403)
+                return
             if minutes <= 0 or minutes > 24 * 60:
                 self._send_json({'error': 'minutes out of range'}, status=400)
                 return
@@ -2612,13 +2846,16 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 grant_time(profile_id, minutes, self._request_id(qs))
             except Exception as exc:
                 log.exception('grant failed for profile_id=%s minutes=%s', profile_id, minutes)
+                record_activity(actor, 'grant', profile_id, minutes=minutes, ok=False, detail=str(exc))
                 self._send_json({'error': str(exc)}, status=500)
                 return
+            record_activity(actor, 'grant', profile_id, minutes=minutes)
             self._send_json({'ok': True})
             return
 
         if parsed.path == '/api/revoke':
-            if not self._token_ok(qs):
+            actor = get_actor(self._supplied_token(qs))
+            if not actor:
                 self._send_json({'error': 'forbidden'}, status=403)
                 return
             try:
@@ -2626,17 +2863,26 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 self._send_json({'error': 'bad request'}, status=400)
                 return
+            if not can_change(actor, profile_id):
+                self._send_json({'error': "This link can't change that profile"}, status=403)
+                return
+            now = int(time.time())
+            previous_expiry = profile_reward_state(profile_id)[1]
+            removed = -((previous_expiry - now) // 60) if previous_expiry else 0
             try:
                 revoke_time(profile_id, self._request_id(qs))
             except Exception as exc:
                 log.exception('revoke failed for profile_id=%s', profile_id)
+                record_activity(actor, 'revoke', profile_id, minutes=removed, ok=False, detail=str(exc))
                 self._send_json({'error': str(exc)}, status=500)
                 return
+            record_activity(actor, 'revoke', profile_id, minutes=removed)
             self._send_json({'ok': True})
             return
 
         if parsed.path == '/api/set_until':
-            if not self._token_ok(qs):
+            actor = get_actor(self._supplied_token(qs))
+            if not actor:
                 self._send_json({'error': 'forbidden'}, status=403)
                 return
             try:
@@ -2645,16 +2891,24 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 self._send_json({'error': 'bad request'}, status=400)
                 return
+            if not can_change(actor, profile_id):
+                self._send_json({'error': "This link can't change that profile"}, status=403)
+                return
             now = int(time.time())
             if until <= now or until > now + 32 * 24 * 3600:
                 self._send_json({'error': 'Pick a date within one month from today'}, status=400)
                 return
+            previous_expiry = profile_reward_state(profile_id)[1]
+            added = (until - max(now, previous_expiry or now)) // 60
             try:
                 set_expiry(profile_id, until, self._request_id(qs))
             except Exception as exc:
                 log.exception('set_until failed for profile_id=%s', profile_id)
+                record_activity(actor, 'set_until', profile_id, minutes=added, until=until,
+                                ok=False, detail=str(exc))
                 self._send_json({'error': str(exc)}, status=500)
                 return
+            record_activity(actor, 'set_until', profile_id, minutes=added, until=until)
             self._send_json({'ok': True})
             return
 
@@ -2679,7 +2933,18 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             if expires_at <= now or expires_at > now + 365 * 24 * 3600:
                 self._send_json({'error': 'Pick a date within the next year'}, status=400)
                 return
-            new_token = create_guest_token(label, expires_at)
+            profile_ids = None
+            if qs.get('profile_ids', [''])[0]:
+                try:
+                    profile_ids = sorted(set(int(x) for x in qs['profile_ids'][0].split(',')))
+                except ValueError:
+                    self._send_json({'error': 'bad request'}, status=400)
+                    return
+            new_token = create_guest_token(label, expires_at, profile_ids)
+            scope = 'all profiles' if profile_ids is None else ', '.join(
+                profile_reward_state(pid)[0] or str(pid) for pid in profile_ids)
+            record_activity(get_actor(self._supplied_token(qs)), 'guest_link_created', until=expires_at,
+                            detail='%s (%s)' % (label, scope))
             self._send_json({'ok': True, 'token': new_token})
             return
 
@@ -2697,14 +2962,19 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if not label:
                     self._send_json({'error': 'Give the new admin link a name'}, status=400)
                     return
-                self._send_json({'ok': True, 'token': create_admin_token(label, email)})
+                new_token = create_admin_token(label, email)
+                record_activity(get_actor(me), 'admin_link_created', detail=label)
+                self._send_json({'ok': True, 'token': new_token})
                 return
             target = qs.get('admin_token', [''])[0]
             if not target:
                 self._send_json({'error': 'bad request'}, status=400)
                 return
+            target_label = ([a['label'] for a in list_admin_tokens() if a['token'] == target] or ['?'])[0]
             if parsed.path == '/api/admins/set_email':
                 set_admin_email(target, email)
+                record_activity(get_actor(me), 'admin_alert_email_set',
+                                detail='%s: %s' % (target_label, email or 'alerts off'))
             else:
                 if target == me:
                     self._send_json({'error': "You can't revoke your own link"}, status=400)
@@ -2714,6 +2984,7 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self._send_json({'error': str(exc)}, status=400)
                     return
+                record_activity(get_actor(me), 'admin_link_revoked', detail=target_label)
             self._send_json({'ok': True})
             return
 
@@ -2725,7 +2996,9 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not guest_token:
                 self._send_json({'error': 'bad request'}, status=400)
                 return
-            revoke_guest_token(guest_token)
+            revoked_label = revoke_guest_token(guest_token)
+            if revoked_label:
+                record_activity(get_actor(self._supplied_token(qs)), 'guest_link_revoked', detail=revoked_label)
             self._send_json({'ok': True})
             return
 
