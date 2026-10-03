@@ -357,6 +357,16 @@ delete both the app's install directory and its `-root` companion.
   `cert-sync.sh` and the boot scripts do everything inside the app
   directory as the app user (via `su`).
 
+## Running the tests
+
+The schedule logic has unit tests that run on both the router's Python 2.7
+and Python 3:
+
+```
+python3 -m unittest discover -s tests -t .     # on your own computer
+tests/run_on_router.sh <ssh-host>               # on the router itself
+```
+
 ## License
 
 MIT - see [LICENSE](LICENSE).
