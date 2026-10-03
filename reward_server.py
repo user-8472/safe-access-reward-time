@@ -2503,9 +2503,11 @@ function renderActivity(data) {
   var people = Object.keys(data.summary).sort();
   var cell = function (s) {
     if (!s || !(s.grants + s.custom + s.revokes + s.pauses)) return '&ndash;';
-    return (s.grants + s.custom) + ' &middot; ' + formatRemaining(s.minutes) +
-           (s.revokes ? ' &middot; ' + s.revokes + ' revoked' : '') +
-           (s.pauses ? ' &middot; ' + s.pauses + ' paused' : '');
+    var parts = [];
+    if (s.grants + s.custom) parts.push((s.grants + s.custom) + ' &middot; ' + formatRemaining(s.minutes));
+    if (s.revokes) parts.push(s.revokes + ' revoked');
+    if (s.pauses) parts.push(s.pauses + ' paused');
+    return parts.join(' &middot; ');
   };
   document.getElementById('activity-summary').innerHTML = people.length
     ? '<tr><th></th><th>Last 7 days</th><th>Last 30 days</th></tr>' + people.map(function (name) {
@@ -2602,7 +2604,7 @@ function renderSchedule() {
       ? '<div class="sched-add"><select id="sched-add-start">' + timeOptions(0, 1425, 420) + '</select>' +
         '<span>to</span><select id="sched-add-end">' + timeOptions(15, 1440, 1260) + '</select>' +
         '<button data-sched-add-confirm="' + d + '">Add</button>' +
-        '<button class="modal-cancel-btn" data-sched-add-cancel="1">Cancel</button></div>'
+        '<button class="modal-cancel-btn" data-sched-add-cancel="1" aria-label="Cancel">&times;</button></div>'
       : '';
     return '<div class="sched-day"><div class="sched-day-head"><span class="sched-day-name">' + DAY_NAMES[d] + '</span>' +
            '<span class="sched-links"><button data-sched-add="' + d + '">+ Add</button>' +
