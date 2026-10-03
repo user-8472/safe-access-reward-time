@@ -1672,6 +1672,17 @@ PAGE_TEMPLATE = """<!doctype html>
   .modal-status-line { text-align: center; font-size: 14px; color: #9b9ba1; margin: -6px 0 14px; }
   .date-picker-wrap { position: relative; margin-bottom: 16px; }
   .date-toggle-btn { width: 100%; background: #2c2c2e; font-size: 15px; padding: 10px 0; }
+  /* The time picker also edits schedule windows, on top of the schedule editor. */
+  #modal-backdrop { z-index: 110; }
+  .win-ends { display: flex; gap: 8px; margin-bottom: 16px; }
+  .win-ends button { flex: 1; background: #2c2c2e; font-size: 15px; padding: 10px 0; }
+  .win-ends button.active, .win-days button.on { background: #0a84ff; color: #fff; }
+  .win-apply { margin-bottom: 14px; }
+  .win-days { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
+  .win-days button { padding: 9px 0; font-size: 14px; background: #2c2c2e; color: #9b9ba1; }
+  .win-note { font-size: 12px; color: #9b9ba1; margin-top: 6px; }
+  .modal-delete-btn { background: transparent; box-shadow: inset 0 0 0 1px #ff453a; color: #ff453a; }
+  .sched-chip { cursor: pointer; }
   .cal-panel { display: none; position: absolute; top: calc(100% + 8px); left: 0; right: 0;
                background: #262628; border: 1px solid #3a3a3c; border-radius: 12px; padding: 14px;
                z-index: 10; box-shadow: 0 8px 24px rgba(0,0,0,0.45); box-sizing: border-box; }
@@ -1708,9 +1719,6 @@ PAGE_TEMPLATE = """<!doctype html>
                 padding: 5px 8px; margin: 6px 6px 0 0; font-size: 14px; }
   .sched-chip button { background: none; color: #ff453a; padding: 0 2px; font-size: 16px; width: auto; }
   .sched-none { color: #9b9ba1; font-size: 14px; margin-top: 4px; }
-  .sched-add { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
-  .sched-add select { padding: 8px; font-size: 14px; background: #2c2c2e; color: #eee; border: none; border-radius: 8px; }
-  .sched-add button { width: auto; padding: 8px 12px; font-size: 14px; }
   .btns .sched-btn { grid-column: span 2; background: #2c2c2e; font-size: 15px; }
   .section-head { display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
   .section-head .fold { color: #9b9ba1; font-size: 15px; transition: transform 0.15s; }
@@ -1822,11 +1830,14 @@ PAGE_TEMPLATE = """<!doctype html>
     #modal-backdrop .modal-title,
     #modal-backdrop .modal-status-line,
     #modal-backdrop .date-picker-wrap,
+    #modal-backdrop .win-ends,
+    #modal-backdrop .win-apply,
     #modal-backdrop .time-columns-header,
     #modal-backdrop .modal-actions { flex: none; }
     #modal-backdrop .time-columns { flex: 1 1 auto; min-height: 0; margin-bottom: 10px; }
     #modal-backdrop .time-col { min-height: 0; gap: 4px; }
-    #modal-backdrop .time-col button { flex: 1 1 auto; min-height: 0; box-sizing: border-box; }
+    #modal-backdrop .time-col button { flex: 1 1 auto; min-height: 0; box-sizing: border-box;
+                                       display: flex; align-items: center; justify-content: center; padding: 0; }
   }
 </style>
 </head>
@@ -1883,13 +1894,25 @@ PAGE_TEMPLATE = """<!doctype html>
         <div class="cal-grid" id="cal-grid"></div>
       </div>
     </div>
+    <div class="win-ends" id="win-ends" style="display:none">
+      <button type="button" id="win-start-btn">Start</button>
+      <button type="button" id="win-end-btn">End</button>
+    </div>
     <div class="time-columns-header"><div>Hour</div><div>Min</div><div>&nbsp;</div></div>
     <div class="time-columns">
       <div class="time-col" id="hour-grid"></div>
       <div class="time-col" id="minute-grid"></div>
       <div class="time-col" id="ampm-row"></div>
     </div>
+    <div class="win-apply" id="win-apply" style="display:none">
+      <button type="button" class="date-toggle-btn" id="win-apply-toggle">Apply to&hellip;</button>
+      <div id="win-days-wrap" style="display:none">
+        <div class="win-days" id="win-days"></div>
+        <div class="win-note">Other selected days get their times replaced with this one.</div>
+      </div>
+    </div>
     <div class="modal-actions">
+      <button type="button" class="modal-delete-btn" id="modal-delete-btn" style="display:none">Delete</button>
       <button type="button" class="modal-cancel-btn" id="modal-cancel-btn">Cancel</button>
       <button type="button" id="modal-set-btn">Set</button>
     </div>
@@ -2014,10 +2037,21 @@ function renderCalendarGrid() {
 
 function openPicker(context) {
   modalContext = context;
+  var isWindow = context.type === 'window';
+  document.querySelector('#modal-backdrop .date-picker-wrap').style.display = isWindow ? 'none' : '';
+  document.getElementById('win-ends').style.display = isWindow ? '' : 'none';
+  document.getElementById('win-apply').style.display = isWindow ? '' : 'none';
+  document.getElementById('modal-delete-btn').style.display = isWindow && context.index !== null ? '' : 'none';
+  document.getElementById('modal-set-btn').textContent = isWindow ? 'Save' : 'Set';
   calendarViewDate = new Date();
   selectedDay = new Date();
   selectedDay.setHours(0, 0, 0, 0);
   setDefaultTime();
+  if (isWindow) {
+    document.getElementById('win-days-wrap').style.display = 'none';
+    selectWindowEnd('start');
+    renderWinDays();
+  }
   renderHourGrid();
   renderMinuteGrid();
   renderAmPm();
@@ -2026,7 +2060,9 @@ function openPicker(context) {
   document.getElementById('cal-panel').classList.remove('open');
   document.getElementById('modal-title').textContent =
     context.type === 'reward' ? 'Custom reward time'
-    : context.type === 'pause' ? 'Pause internet until' : 'Custom access length';
+    : context.type === 'pause' ? 'Pause internet until'
+    : context.type === 'window' ? (context.index === null ? 'Add time: ' : 'Edit time: ') + DAY_NAMES[context.day]
+    : 'Custom access length';
   document.getElementById('modal-status-line').textContent = '';
   document.getElementById('modal-backdrop').classList.add('open');
 }
@@ -2043,7 +2079,95 @@ function getPickerEpoch() {
   return Math.floor(d.getTime() / 1000);
 }
 
+// --- Schedule window editing (the picker in 'window' mode) ---
+// modalContext: { type: 'window', day, index (null when adding), start, end,
+//                 editing: 'start'|'end', days: [7 booleans] }
+
+function minutesToPicker(m) {
+  var h24 = Math.floor(m / 60) % 24;  // 1440 (midnight, end of day) shows as 12:00 AM
+  selectedHour = h24 % 12 || 12;
+  selectedMinute = m % 60;
+  selectedAmPm = h24 >= 12 ? 'PM' : 'AM';
+}
+
+function pickerToMinutes(isEnd) {
+  var m = ((selectedHour % 12) + (selectedAmPm === 'PM' ? 12 : 0)) * 60 + selectedMinute;
+  return isEnd && m === 0 ? 1440 : m;
+}
+
+function updateWindowEndButtons() {
+  var c = modalContext;
+  var startBtn = document.getElementById('win-start-btn');
+  var endBtn = document.getElementById('win-end-btn');
+  startBtn.textContent = 'Start ' + minuteLabel(c.start);
+  endBtn.textContent = 'End ' + minuteLabel(c.end);
+  startBtn.classList.toggle('active', c.editing === 'start');
+  endBtn.classList.toggle('active', c.editing === 'end');
+}
+
+function selectWindowEnd(which) {
+  modalContext.editing = which;
+  minutesToPicker(which === 'start' ? modalContext.start : modalContext.end);
+  renderHourGrid();
+  renderMinuteGrid();
+  renderAmPm();
+  updateWindowEndButtons();
+}
+
+// Called after any hour/minute/AM-PM pick, to keep the edited end in sync.
+function windowPickChanged() {
+  if (!modalContext || modalContext.type !== 'window') return;
+  var isEnd = modalContext.editing === 'end';
+  modalContext[isEnd ? 'end' : 'start'] = pickerToMinutes(isEnd);
+  updateWindowEndButtons();
+}
+
+function renderWinDays() {
+  var days = modalContext.days;
+  var all = days.every(function (on) { return on; });
+  document.getElementById('win-days').innerHTML =
+    '<button type="button" class="' + (all ? 'on' : '') + '" data-win-day="all">All</button>' +
+    DAY_NAMES.map(function (name, d) {
+      return '<button type="button" class="' + (days[d] ? 'on' : '') + '" data-win-day="' + d + '">' +
+             name.slice(0, 3) + '</button>';
+    }).join('');
+}
+
+function mergeWindows(windows) {
+  var merged = [];
+  windows.slice().sort(function (a, b) { return a[0] - b[0]; }).forEach(function (w) {
+    var last = merged[merged.length - 1];
+    if (last && w[0] <= last[1]) { last[1] = Math.max(last[1], w[1]); } else { merged.push([w[0], w[1]]); }
+  });
+  return merged;
+}
+
+function saveWindow() {
+  var c = modalContext;
+  if (c.end <= c.start) { toast('The end has to be after the start'); return; }
+  var win = [c.start, c.end];
+  c.days.forEach(function (on, d) {
+    if (!on) return;
+    if (d === c.day) {
+      var others = schedEdit.days[d].filter(function (w, i) { return i !== c.index; });
+      schedEdit.days[d] = mergeWindows(others.concat([win]));
+    } else {
+      schedEdit.days[d] = [[win[0], win[1]]];  // "Apply to" replaces that day's times
+    }
+  });
+  closePicker();
+  renderSchedule();
+}
+
+function openWindowEditor(day, index) {
+  var w = index === null ? [420, 1260] : schedEdit.days[day][index];
+  var days = [false, false, false, false, false, false, false];
+  days[day] = true;
+  openPicker({ type: 'window', day: day, index: index, start: w[0], end: w[1], editing: 'start', days: days });
+}
+
 function submitPicker() {
+  if (modalContext.type === 'window') { saveWindow(); return; }
   var epoch = getPickerEpoch();
   if (epoch <= Math.floor(Date.now() / 1000)) {
     toast('Pick a time in the future');
@@ -2653,7 +2777,7 @@ function guestUrl(token) {
 
 
 var DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-var schedEdit = null; // { profileId, name, days: [[ [start, end], ... ] x7], adding: dayIndex or null }
+var schedEdit = null; // { profileId, name, days: [[ [start, end], ... ] x7] }
 
 function minuteLabel(m) {
   if (m === 1440) return 'midnight';
@@ -2661,30 +2785,16 @@ function minuteLabel(m) {
   return ((h + 11) % 12 + 1) + ':' + (mm < 10 ? '0' : '') + mm + ' ' + (h < 12 ? 'AM' : 'PM');
 }
 
-function timeOptions(from, to, selected) {
-  var out = '';
-  for (var m = from; m <= to; m += 15) {
-    out += '<option value="' + m + '"' + (m === selected ? ' selected' : '') + '>' + minuteLabel(m) + '</option>';
-  }
-  return out;
-}
-
 function renderSchedule() {
   document.getElementById('sched-title').textContent = 'Schedule: ' + schedEdit.name;
   document.getElementById('sched-days').innerHTML = schedEdit.days.map(function (windows, d) {
     var chips = windows.length ? windows.map(function (w, i) {
-      return '<span class="sched-chip">' + minuteLabel(w[0]) + ' &ndash; ' + minuteLabel(w[1]) +
+      return '<span class="sched-chip" data-sched-edit="' + d + ',' + i + '">' + minuteLabel(w[0]) + ' &ndash; ' + minuteLabel(w[1]) +
              '<button data-sched-remove="' + d + ',' + i + '" aria-label="Remove">&times;</button></span>';
     }).join('') : '<div class="sched-none">Blocked all day</div>';
-    var adding = schedEdit.adding === d
-      ? '<div class="sched-add"><select id="sched-add-start">' + timeOptions(0, 1425, 420) + '</select>' +
-        '<span>to</span><select id="sched-add-end">' + timeOptions(15, 1440, 1260) + '</select>' +
-        '<button data-sched-add-confirm="' + d + '">Add</button>' +
-        '<button class="modal-cancel-btn" data-sched-add-cancel="1" aria-label="Cancel">&times;</button></div>'
-      : '';
     return '<div class="sched-day"><div class="sched-day-head"><span class="sched-day-name">' + DAY_NAMES[d] + '</span>' +
            '<span class="sched-links"><button data-sched-add="' + d + '">+ Add</button>' +
-           '<button data-sched-copy="' + d + '">Copy to all days</button></span></div>' + chips + adding + '</div>';
+           '<button data-sched-copy="' + d + '">Copy to all days</button></span></div>' + chips + '</div>';
   }).join('');
 }
 
@@ -2693,7 +2803,7 @@ function openScheduleEditor(profileId) {
   fetch('/api/schedule?token=' + encodeURIComponent(TOKEN) + '&profile_id=' + profileId)
     .then(parseResponse)
     .then(function (data) {
-      schedEdit = { profileId: profileId, name: p ? p.name : 'profile', days: data.days, adding: null };
+      schedEdit = { profileId: profileId, name: p ? p.name : 'profile', days: data.days };
       renderSchedule();
       document.getElementById('sched-backdrop').classList.add('open');
     })
@@ -2756,22 +2866,11 @@ document.addEventListener('click', function (e) {
         .finally(function () { setBusy(t, false); });
       return;
     }
-    if (t && t.dataset.schedAdd !== undefined) { schedEdit.adding = Number(t.dataset.schedAdd); renderSchedule(); return; }
-    if (t && t.dataset.schedAddCancel !== undefined) { schedEdit.adding = null; renderSchedule(); return; }
-    if (t && t.dataset.schedAddConfirm !== undefined) {
-      var d = Number(t.dataset.schedAddConfirm);
-      var start = Number(document.getElementById('sched-add-start').value);
-      var end = Number(document.getElementById('sched-add-end').value);
-      if (end <= start) { toast('The end has to be after the start'); return; }
-      // Merge with any overlapping or touching windows that day.
-      var merged = [], cur = [start, end];
-      schedEdit.days[d].concat([cur]).sort(function (a, b) { return a[0] - b[0]; }).forEach(function (w) {
-        var last = merged[merged.length - 1];
-        if (last && w[0] <= last[1]) { last[1] = Math.max(last[1], w[1]); } else { merged.push([w[0], w[1]]); }
-      });
-      schedEdit.days[d] = merged;
-      schedEdit.adding = null;
-      renderSchedule();
+    if (t && t.dataset.schedAdd !== undefined) { openWindowEditor(Number(t.dataset.schedAdd), null); return; }
+    var chip = !t && e.target.closest('[data-sched-edit]');
+    if (chip) {
+      var at = chip.dataset.schedEdit.split(',');
+      openWindowEditor(Number(at[0]), Number(at[1]));
       return;
     }
     if (t && t.dataset.schedRemove !== undefined) {
@@ -3007,6 +3106,7 @@ document.addEventListener('click', function (e) {
   if (hourBtn) {
     selectedHour = Number(hourBtn.dataset.hour);
     renderHourGrid();
+    windowPickChanged();
     return;
   }
 
@@ -3014,6 +3114,7 @@ document.addEventListener('click', function (e) {
   if (minuteBtn) {
     selectedMinute = Number(minuteBtn.dataset.minute);
     renderMinuteGrid();
+    windowPickChanged();
     return;
   }
 
@@ -3021,11 +3122,40 @@ document.addEventListener('click', function (e) {
   if (ampmBtn) {
     selectedAmPm = ampmBtn.dataset.ampm;
     renderAmPm();
+    windowPickChanged();
     return;
   }
 
   if (e.target.id === 'modal-set-btn') {
     submitPicker();
+    return;
+  }
+  if (e.target.id === 'win-start-btn' || e.target.id === 'win-end-btn') {
+    selectWindowEnd(e.target.id === 'win-start-btn' ? 'start' : 'end');
+    return;
+  }
+  if (e.target.id === 'win-apply-toggle') {
+    var wrap = document.getElementById('win-days-wrap');
+    wrap.style.display = wrap.style.display === 'none' ? '' : 'none';
+    return;
+  }
+  var winDayBtn = e.target.closest('button[data-win-day]');
+  if (winDayBtn) {
+    var key = winDayBtn.dataset.winDay;
+    var wd = modalContext.days;
+    if (key === 'all') {
+      var allOn = wd.every(function (on) { return on; });
+      modalContext.days = wd.map(function (on, d) { return allOn ? d === modalContext.day : true; });
+    } else {
+      wd[Number(key)] = !wd[Number(key)];
+    }
+    renderWinDays();
+    return;
+  }
+  if (e.target.id === 'modal-delete-btn') {
+    schedEdit.days[modalContext.day].splice(modalContext.index, 1);
+    closePicker();
+    renderSchedule();
     return;
   }
 
