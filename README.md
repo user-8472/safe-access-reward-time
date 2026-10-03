@@ -10,15 +10,45 @@ in the future.
 
 # Safe Access Reward Time
 
-A small, self-hosted web app for adding "reward time" to a kid's device on a
-Synology router running **Safe Access** (SRM's parental-control package) —
-without the friction of the official DS Router app. Built for phones: big
-buttons, a quick +5/+15/+30/+60 minute grid per profile, a custom date/time
-picker, and time-limited "babysitter" access links you can text to someone
-else so they can manage screen time themselves for a few hours or a few days.
+A small, self-hosted web app for managing kids' screen time on a Synology router running
+**Safe Access** (SRM's parental-control package) - without the friction of the official DS Router
+app. Built for phones: one card per kid or device with quick **+5/+15/+30/+60 minute** reward time,
+**pause internet** buttons, a **weekly schedule editor**, today's usage, and time-limited
+**babysitter links** you can text to someone else. It shows **who did what** (each parent and
+babysitter has their own link), and emails you if something breaks, plus an optional weekly
+summary.
 
-It runs entirely on the router itself. No cloud service, no external
-dependencies beyond what SRM already ships with.
+It runs entirely on the router itself. No cloud service, no external dependencies beyond what SRM
+already ships with.
+
+**Jump to:** [Screenshots](#screenshots) · [What you get](#what-you-get) ·
+[Prerequisites](#prerequisites) · [Router setup](#setting-up-your-router-first) ·
+[Installing](#installing) · [Updating](#updating-an-install) · [Using it](#using-it) ·
+[Architecture](#architecture) · [Troubleshooting](#troubleshooting) ·
+[Uninstalling](#uninstalling) · [Security notes](#security-notes) · [Tests](#running-the-tests)
+
+## Screenshots
+
+<table>
+<tr>
+<td align="center" width="50%"><img src="docs/screenshots/01-main-list.png" width="260" alt="Main list"><br>
+<sub>One card per kid or device: reward time, today's schedule window and usage</sub></td>
+<td align="center" width="50%"><img src="docs/screenshots/02-expanded-cards.png" width="260" alt="Expanded cards"><br>
+<sub>Quick reward buttons, pause (tap again to extend), Resume and Revoke</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/03-schedule-editor.png" width="260" alt="Schedule editor"><br>
+<sub>Weekly schedule editor: the times internet is allowed</sub></td>
+<td align="center"><img src="docs/screenshots/04-time-editor.png" width="260" alt="Time editor"><br>
+<sub>Editing a time, and applying it to other days</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/05-babysitter-and-admin.png" width="260" alt="Babysitter and admin access"><br>
+<sub>Babysitter links (optionally for some devices only) and per-person admin links</sub></td>
+<td align="center"><img src="docs/screenshots/06-activity.png" width="260" alt="Activity"><br>
+<sub>Who did what, with weekly and monthly totals</sub></td>
+</tr>
+</table>
 
 ## Why this exists, and why it's built the way it is
 
@@ -33,18 +63,25 @@ this app avoids it.
 
 ## What you get
 
-- A mobile-first page per restricted profile/device with quick-add buttons,
-  a revoke button, and a full custom date/time picker (with your own
-  built-in calendar and hour/minute/AM-PM columns - no fiddly native input).
-- Drag-free reordering (tap arrows) and collapsible cards, remembered
-  per-browser.
-- **Babysitter/guest access**: generate a separate link, good for anywhere
-  from a few hours up to a year, that lets whoever you send it to grant or
-  revoke reward time themselves - without your admin token, and without
-  them being able to create more links of their own. Revoke it early anytime.
-- Runs as a resilient background service: a watchdog checks real health
-  (not just "is the process alive") every minute and restarts it if needed,
-  and it survives router reboots.
+- **A card per restricted profile or device** showing active reward time, today's schedule window
+  ("Scheduled on now: 6:00 AM - 9:00 PM", or the next one) and today's usage, including how much was
+  reward time. Cards collapse and reorder with tap arrows, remembered per browser.
+- **Reward time:** +5m/+15m/+30m/+60m buttons that stack, and **Custom** for an exact date and time.
+- **Pause internet:** **+30m** pauses (tap again to extend), **Until...** pauses to a set time.
+  **Resume** ends a pause, and **Revoke** puts the profile back on its normal schedule (removes
+  reward time and any pause).
+- **Schedule editing:** a weekly editor of allowed times, saved to Safe Access live (it shows in the
+  DS Router app too). Copy a time to other days, and undo any change from the activity log.
+- **Per-person links:** each parent gets their own admin link (create or revoke more from the
+  page), and **babysitter links** last anywhere from a few hours to a year, optionally limited to
+  some devices. Babysitters can grant, revoke and pause, but can't create links or see the admin
+  sections.
+- **Activity log:** who did what and when, with per-person weekly and monthly totals.
+- **Email alerts and a weekly summary:** a health monitor emails each admin who set an alert address
+  when something breaks (and when it recovers) or an action fails, and optionally a Sunday summary
+  of the week's usage.
+- **Runs unattended:** watchdogs check real health every minute and restart things, and it survives
+  router reboots.
 
 ## Prerequisites
 
@@ -177,6 +214,12 @@ brand/model, so check that router's own documentation.
 5. Open the URL the installer printed, bookmark it or add it to your
    phone's home screen.
 
+6. Optional, for email alerts and the weekly summary: create a Gmail *app password*
+   (Google account -> Security -> 2-Step Verification -> App passwords) and run
+   `./set-alert-email.sh` from the app directory. It stores the sender and sends a test. Then
+   set an alert email on your admin link (Admin Access on the page) and tick
+   "Weekly usage email" if you want the Sunday summary.
+
 Since it's a self-signed certificate by default, your browser will warn you
 the first time. You can just tap through it, or - to make the warning go
 away permanently - AirDrop/email yourself `cert/fullchain.pem`, install it
@@ -210,56 +253,65 @@ expects (a leaf-only `server.crt`/`server.key` pair at the standard SRM
 path, chain completed via the local admin HTTPS port) - if it fails, you're
 no worse off than the self-signed default.
 
+## Updating an install
+
+From a checkout of this repo on your own computer, with SSH access to the router as the app user:
+
+```
+./deploy.sh <ssh-host> [/volume1/reward-time]
+```
+
+It copies the app's own files, compile-checks them with the router's Python, backs up the current
+ones into `backups/<timestamp>/` (keeping the newest 5), restarts the server and checks it answers.
+If it doesn't, it prints how to roll back. Changes to the root-owned parts (`root/`) need root, so
+copy those into `<your-install-dir>-root` yourself as in the installer's steps.
+
 ## Using it
 
-Open the app link. Each restricted Safe Access profile (a kid's account, or
-a specific device) gets its own collapsed card, showing whether it
-currently has active reward time:
+Open your link. Each restricted Safe Access profile (a kid's account, or a specific device) has a
+card; tap its header to expand it (see the [screenshots](#screenshots)).
 
-![Main list, collapsed](docs/screenshots/01-main-list.png)
+### Reward time
 
-Tap a card's header to expand it:
+The **+5m ... +60m** buttons stack: tap **+15m** then **+30m** and it ends up 45 minutes, with no
+need to wait for the first to finish. **Custom** opens a date/time picker sized to fit the screen;
+it closes as soon as you tap **Set** and applies in the background, so you can move on to the next
+device.
 
-![Expanded card showing the quick-add buttons](docs/screenshots/02-expanded-card.png)
+### Pausing internet
 
-This reveals four quick-add buttons - tap one for an instant grant. They
-stack: tap **+15m** then **+30m** right after and the device ends up with
-45 minutes total, with no need to wait for the first tap to finish before
-making the next one. There's also **Custom** for an exact date/time, and
-**Revoke** to end active reward time immediately. Use the small up/down
-arrows to reorder cards, and tap a header again to collapse it - both are
-remembered per-browser, not shared across devices.
+**+30m** pauses the profile for 30 minutes; tapping it again adds another 30 to the end.
+**Until...** pauses to a chosen time. While paused, the card shows "Paused until ..." and the last
+row offers **Resume** (end the pause, keep any reward time) and **Revoke** (end both and go back to
+the normal schedule). Safe Access itself only pauses indefinitely, so timed pauses are ended by the
+app's background daemon.
 
-### Custom date & time
+### Editing schedules
 
-Tapping **Custom** opens a picker sized to fit your screen without
-scrolling: pick a date from the calendar (it opens on today), then an
-hour, minute, and AM/PM, and tap **Set**.
+**Edit schedule** (admins only) shows each day's allowed times. Tap a time to change its start or
+end in the same picker; **Apply to...** adds it to other days too (merging with times already
+there). **+ Add** adds a time, and **Copy to all days** makes every day match one. Nothing changes
+until **Save**. A schedule with no allowed time at all asks for confirmation. Every change is
+recorded with the previous schedule, and its entry in Activity has an **Undo** button.
 
-![Custom date and time picker](docs/screenshots/03-custom-picker.png)
+### Babysitter access
 
-The picker closes immediately after you tap **Set** - it applies in the
-background, so you can move straight on to another device rather than
-waiting for it to finish.
+Name who a link is for and pick how long it lasts (a few hours up to a year). By default it covers
+all devices; untick **All devices** to pick some. Creating it copies the link to your clipboard. A
+badge on the heading shows how many are active; open a row to see its link again or revoke it.
 
-### Babysitter / guest access
+### Admin access and alerts
 
-At the bottom, the "Add a token" card lets you name who a temporary access
-link is for and choose how long it should last - a preset number of hours
-or days, or an exact date/time up to a year out:
+Every admin link has a name, which is what Activity shows. Open a row to copy its link, set an
+alert email, tick **Weekly usage email (Sundays)**, or revoke it. You can't revoke your own link,
+or the last one. A warning banner appears at the top of the page if the health monitor sees a
+problem.
 
-![Add a token card](docs/screenshots/04-add-token.png)
+### Activity
 
-Creating one copies the link straight to your clipboard - ready to text or
-message to whoever needs it - and shows it in the list above. It works
-like your own link, except it can only grant or revoke reward time; it
-can't create more links or see this list. Tap an entry in the list to
-reveal its full link again later (handy if you need to resend it) - the
-text field is selectable so you can copy it manually:
-
-![An expanded token entry showing its selectable link](docs/screenshots/05-token-expanded.png)
-
-Revoke a token early right from its row, or just let it expire on its own.
+A per-person table of the last 7 and 30 days (actions and minutes granted, revokes, pauses), and the
+recent actions, filterable by person. Failed actions show in red. The Babysitter Access, Admin
+Access and Activity sections fold, remembered per browser.
 
 ## Architecture
 
@@ -289,10 +341,23 @@ split exists specifically because a direct database write does *not*
 reliably trigger live enforcement - confirmed by testing both paths against
 a real device.
 
-Everything else (watchdogs, boot scripts, log rotation, TLS handshake
-timeouts to survive internet port-scanning) exists because this app is
-reachable from the open internet by design, and needs to keep running
-unattended.
+Pausing (`SYNO.SafeAccess.AccessControl.ConfigGroup`) and schedule changes
+(`SYNO.SafeAccess.AccessControl.Profile.Schedule.Blocktime`) go the same way.
+Safe Access only pauses indefinitely, so `apply_daemon.py` also keeps timed
+pauses in `pauses.json` and ends them when due.
+
+Around that:
+
+- `tokens.db` (app directory) holds the admin and babysitter links and the
+  activity log.
+- `monitor.py` runs every minute as the app user and checks the web app, the
+  daemons' heartbeats and the certificate sync. It emails problems,
+  recoveries and failed actions, and sends the weekly summary. Its state also
+  drives the page's warning banner.
+- Everything else (watchdogs, boot scripts, log rotation, TLS handshake
+  timeouts to survive internet port-scanning) exists because this app is
+  reachable from the open internet by design, and needs to keep running
+  unattended.
 
 ## Troubleshooting
 
@@ -313,6 +378,16 @@ unattended.
 - **A request seems to hang for exactly 5 seconds then fails**: means
   `apply_daemon.py` isn't picking up requests - check it's running and
   check its log.
+- **A warning banner at the top of the page**: it lists what the health
+  monitor found; `monitor.log` in the app directory has the history.
+  "Health monitor last ran N minutes ago" means its cron entry
+  (`monitor_launcher.sh`) isn't running.
+- **The server keeps restarting**: `server.crash.log` has startup errors and
+  tracebacks, plus a line for every restart. `server.log` is the request log.
+- **No alert emails**: run `python monitor.py --test-email` in the app
+  directory. Check the admin link has an alert email set, and that
+  `set-alert-email.sh` was given a Gmail *app password*, not the account
+  password.
 
 ## Uninstalling
 
@@ -325,16 +400,17 @@ rm /usr/local/etc/rc.d/reward-time.sh /usr/local/etc/rc.d/reward-apply.sh
 ```
 
 Then edit `/etc/crontab` to remove the lines this app added
-(`app_watchdog.sh`, `apply_watchdog.sh`, and `cert-sync.sh` if you enabled
-it), restart crond (`/usr/syno/sbin/synoservicectl --restart crond`), and
+(`app_watchdog.sh`, `apply_watchdog.sh`, `monitor_launcher.sh`, and
+`cert-sync.sh` if you enabled it), restart crond (`/usr/syno/sbin/synoservicectl --restart crond`), and
 delete both the app's install directory and its `-root` companion.
 
 ## Security notes
 
 - The app is gated by a long random bearer token in the URL - anyone with
-  the link has full access (or, for a babysitter link, access limited to
-  granting/revoking reward time until it expires). Don't post the link
-  anywhere public.
+  an admin link has full access, and a babysitter link can only grant,
+  revoke and pause (on its devices) until it expires. Each person has their
+  own link, so one can be revoked without affecting the others, and the
+  activity log shows which link did what. Don't post links anywhere public.
 - It's directly internet-facing by design (that's the point - so you can
   use it away from home). It will get hit by routine internet-wide
   vulnerability scanners; the server handles this deliberately (threaded,
@@ -359,8 +435,9 @@ delete both the app's install directory and its `-root` companion.
 
 ## Running the tests
 
-The schedule logic has unit tests that run on both the router's Python 2.7
-and Python 3:
+The schedule logic (windows, and converting between allowed times and Safe
+Access's blocked periods) has unit tests that run on both the router's
+Python 2.7 and Python 3:
 
 ```
 python3 -m unittest discover -s tests -t .     # on your own computer
