@@ -6,3 +6,7 @@ pending/
 *.log
 *.log.[0-9]
 *.pid
+
+# Python bytecode (e.g. from running the tests locally)
+__pycache__/
+*.pyc
