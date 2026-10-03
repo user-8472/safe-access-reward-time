@@ -4,6 +4,7 @@ import BaseHTTPServer
 import SocketServer
 import base64
 import binascii
+import hashlib
 import cgi
 import hmac
 import json
@@ -187,6 +188,31 @@ def revoke_admin_token(token):
         conn.commit()
     finally:
         conn.close()
+
+
+def get_version():
+    # A fingerprint of everything another person (or the DS router app) can
+    # change: the activity log, links, and Safe Access's reward, pause and
+    # schedule tables. Open pages poll it and reload only when it changes.
+    parts = []
+    conn = get_tokens_db()
+    try:
+        parts.append(conn.execute("SELECT MAX(id) FROM activity").fetchone())
+        parts.append(conn.execute("SELECT COUNT(*), MAX(created_at), MAX(expires_at) FROM guest_tokens").fetchone())
+        parts.append(conn.execute(
+            "SELECT COUNT(*), GROUP_CONCAT(label || ':' || IFNULL(email, '') || ':' || weekly) "
+            "FROM admin_tokens").fetchone())
+    finally:
+        conn.close()
+    sa = get_db()
+    try:
+        parts.append(sa.execute("SELECT COUNT(*), MAX(id), MAX(expired) FROM ultra_reward").fetchone())
+        parts.append(sa.execute("SELECT GROUP_CONCAT(IFNULL(pause_expired, 0)) FROM config_group").fetchone())
+        parts.append(sa.execute("SELECT COUNT(*), MAX(id) FROM schedule WHERE type = 3").fetchone())
+    finally:
+        sa.close()
+    parts.append(sorted(load_pauses().items()))
+    return hashlib.md5(repr(parts).encode('utf-8')).hexdigest()[:16]
 
 
 def get_health():
@@ -1616,6 +1642,29 @@ self.addEventListener('activate', function(e) { self.clients.claim(); });
 self.addEventListener('fetch', function(e) { e.respondWith(fetch(e.request)); });
 """
 
+# Served for "/" with no token, e.g. the weekly email's "Open Admin Access"
+# button, which deliberately carries no token. On a phone where the app is
+# installed, the link opens in the app, which remembered its own link on that
+# device; this page continues to it (keeping #section). Nothing is revealed to
+# anyone else.
+LAUNCHER_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reward Time</title>
+<style>body{font-family:-apple-system,sans-serif;background:#111;color:#eee;padding:24px;max-width:420px;margin:auto}
+p{color:#b8b8bd;line-height:1.4}</style></head>
+<body><h2>Reward Time</h2><p id="msg">Opening&hellip;</p>
+<script>
+var t = null;
+try { t = localStorage.getItem('rt_app_token') || localStorage.getItem('rt_token'); } catch (e) {}
+if (t) {
+  location.replace('/?token=' + encodeURIComponent(t) + location.hash);
+} else {
+  document.getElementById('msg').textContent =
+    'Open this from the phone where the Reward Time app is installed, or use your own Reward Time link.';
+}
+</script></body></html>
+"""
+
 PAGE_TEMPLATE = """<!doctype html>
 <html>
 <head>
@@ -1737,6 +1786,13 @@ PAGE_TEMPLATE = """<!doctype html>
   .sched-none { color: #9b9ba1; font-size: 14px; margin-top: 4px; }
   .btns .sched-btn { grid-column: span 2; background: #2c2c2e; font-size: 15px; }
   .section-head { display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+  .sync-icon { width: 0.7em; height: 0.7em; margin-left: auto; border: 3px solid #0a84ff; border-top-color: transparent;
+               border-radius: 50%; opacity: 0; transition: opacity 0.3s; }
+  .sync-icon.on { opacity: 1; animation: sync-spin 0.8s linear infinite; }
+  @keyframes sync-spin { to { transform: rotate(360deg); } }
+  @keyframes attention { 0%, 100% { box-shadow: 0 0 0 0 rgba(10,132,255,0); background-color: transparent; }
+                         50% { box-shadow: 0 0 0 4px rgba(10,132,255,0.9); background-color: rgba(10,132,255,0.18); } }
+  .attention { animation: attention 0.8s ease-in-out 3; border-radius: 10px; }
   .count-badge { display: inline-block; min-width: 1.4em; padding: 1px 7px; margin-left: 6px; border-radius: 999px;
                  background: #2c2c2e; color: #b8b8bd; font-size: 0.75em; text-align: center; vertical-align: 2px; }
   .count-badge.active { background: #0a84ff; color: #fff; }
@@ -1864,7 +1920,7 @@ PAGE_TEMPLATE = """<!doctype html>
 </style>
 </head>
 <body>
-<h1><img src="/icon.svg" alt="" class="app-icon">Reward Time</h1>
+<h1><img src="/icon.svg" alt="" class="app-icon">Reward Time<span class="sync-icon" id="sync-icon" title="Updated with changes from someone else"></span></h1>
 <div class="health-banner" id="health-banner" style="display:none"></div>
 <div id="cards"></div>
 <div id="admin-section" style="display:none">
@@ -1954,6 +2010,13 @@ PAGE_TEMPLATE = """<!doctype html>
 <script>
 var TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('rt_token') || '';
 if (TOKEN) { localStorage.setItem('rt_token', TOKEN); }
+// Only the installed app records its link for tokenless links (the weekly
+// email's button) - a link opened in an ordinary tab mustn't take that over.
+try {
+  if (TOKEN && window.matchMedia && matchMedia('(display-mode: standalone)').matches) {
+    localStorage.setItem('rt_app_token', TOKEN);
+  }
+} catch (e) {}
 if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(function(){}); }
 var PRESETS = __PRESETS__;
 var DURATION_PRESETS = __DURATION_PRESETS__;
@@ -2521,6 +2584,9 @@ function loadProfiles() {
         loadGuestTokens();
         updateAddTokenCardCollapsedState();
       }
+      // Every reload - including after our own actions - becomes the new
+      // baseline, so the sync icon only marks changes made by someone else.
+      resetVersionBaseline();
     });
 }
 
@@ -2742,6 +2808,7 @@ function renderActivity(data) {
 }
 
 function loadActivity() {
+  resetVersionBaseline();  // link changes reload this rather than the cards
   var who = document.getElementById('activity-filter').value;
   fetch('/api/activity?token=' + encodeURIComponent(TOKEN) + '&limit=50' +
         (who ? '&who=' + encodeURIComponent(who) : ''))
@@ -2763,8 +2830,9 @@ document.addEventListener('change', function (e) {
   }
 });
 
-// A link ending in #admin-access (e.g. from the weekly email) opens that
-// section - unfolded if needed - once the admin sections have loaded.
+// A link ending in #admin-access (e.g. the weekly email's button) opens your
+// own row in Admin Access - section unfolded, row expanded - scrolls to its
+// alert email / weekly settings and flashes them.
 var jumpedToHash = false;
 function jumpToHashSection() {
   if (jumpedToHash || location.hash !== '#admin-access') return;
@@ -2776,13 +2844,28 @@ function jumpToHashSection() {
     try { localStorage.setItem('rt_folded_sections', JSON.stringify(folded)); } catch (err) {}
     applyFolded();
   }
-  setTimeout(function () {
-    var head = document.querySelector('.section-head[data-section="admin"]');
-    if (!head) return;
+  var tries = 0;
+  (function waitForRows() {
+    var me = lastAdminLinks.filter(function (a) { return a.is_me; })[0];
+    if (!me && ++tries < 30) { setTimeout(waitForRows, 100); return; }
+    if (me) {
+      expandedAdminLinks[me.token] = true;
+      renderAdminLinks(lastAdminLinks);
+    }
+    var row = me && document.querySelector('[data-admin-toggle="' + me.token + '"]');
+    var target = row ? row.parentNode.querySelector('.guest-row-body') : null;
+    target = target || document.querySelector('.section-head[data-section="admin"]');
+    if (!target) return;
     // Land just below the sticky title bar, which would otherwise cover it.
     var bar = document.querySelector('h1').offsetHeight;
-    window.scrollTo({ top: head.getBoundingClientRect().top + window.pageYOffset - bar - 8, behavior: 'smooth' });
-  }, 600);
+    window.scrollTo({ top: target.getBoundingClientRect().top + window.pageYOffset - bar - 16, behavior: 'smooth' });
+    setTimeout(function () {
+      target.classList.remove('attention');
+      void target.offsetWidth;  // restart the animation
+      target.classList.add('attention');
+    }, 500);
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (err) {}
+  })();
 }
 
 // Foldable admin sections, remembered per browser like the cards.
@@ -3231,7 +3314,67 @@ document.addEventListener('click', function (e) {
   }
 });
 
+// --- Live updates ---
+// While the page is visible, poll a cheap fingerprint of everything other
+// people can change; on a change, reload and briefly show the sync icon.
+// Also refresh quietly every minute (countdowns, usage) and on returning to
+// the page. Nothing refreshes while a picker/editor is open or a field has
+// focus, so it never yanks something out from under you.
+var lastVersion = null;
+var VERSION_POLL_MS = 5000;
+var QUIET_REFRESH_MS = 60000;
+var lastFullRefresh = Date.now();
+
+function userIsBusy() {
+  var el = document.activeElement;
+  var typing = el && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA');
+  var busy = Object.keys(profileBusy).some(function (k) { return profileBusy[k] > 0; });
+  return Boolean(modalContext || schedEdit || typing || busy);
+}
+
+function fetchVersion() {
+  return fetch('/api/version?token=' + encodeURIComponent(TOKEN))
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) { return d && d.v; })
+    .catch(function () { return null; });
+}
+
+// After our own actions (which already reload), take the new state as the
+// baseline so the icon only marks other people's changes.
+function resetVersionBaseline() {
+  fetchVersion().then(function (v) { if (v) lastVersion = v; });
+}
+
+function showSyncIcon() {
+  var icon = document.getElementById('sync-icon');
+  icon.classList.add('on');
+  setTimeout(function () { icon.classList.remove('on'); }, 1500);
+}
+
+function syncTick() {
+  if (document.hidden || userIsBusy()) return;
+  fetchVersion().then(function (v) {
+    if (!v) return;
+    var changed = lastVersion !== null && v !== lastVersion;
+    lastVersion = v;
+    if (changed) {
+      showSyncIcon();
+      lastFullRefresh = Date.now();
+      loadProfiles();
+    } else if (Date.now() - lastFullRefresh > QUIET_REFRESH_MS) {
+      lastFullRefresh = Date.now();
+      loadProfiles();
+    }
+  });
+}
+
+setInterval(syncTick, VERSION_POLL_MS);
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden) { lastFullRefresh = 0; syncTick(); }
+});
+
 loadProfiles();
+resetVersionBaseline();
 </script>
 </body>
 </html>
@@ -3338,6 +3481,11 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/':
+            if not self._supplied_token(qs):
+                # No token in the link (e.g. the weekly email's button): hand
+                # over to the link the installed app remembered on this device.
+                self._send_html(LAUNCHER_PAGE)
+                return
             if not self._token_ok(qs):
                 self._send_html('<h1>Forbidden</h1>', status=403)
                 return
@@ -3346,6 +3494,13 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             manifest_href = '/manifest.json?token=' + urllib.quote(self._supplied_token(qs))
             page = page.replace('__MANIFEST_HREF__', manifest_href)
             self._send_html(page)
+            return
+
+        if parsed.path == '/api/version':
+            if not self._token_ok(qs):
+                self._send_json({'error': 'forbidden'}, status=403)
+                return
+            self._send_json({'v': get_version()})
             return
 
         if parsed.path == '/api/status':

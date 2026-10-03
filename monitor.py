@@ -320,10 +320,12 @@ def weekly_data(now):
         [(a, k, g or 0, m or 0, rv or 0, pz or 0, sc or 0, f or 0) for a, k, g, m, rv, pz, sc, f in people]
 
 
-def admin_link(token):
+def admin_link(token=None):
     # Opens the app (or the installed web app on a phone) at Admin Access.
     base = CONFIG.get('public_url', '').rstrip('/')
-    return '%s/?token=%s#admin-access' % (base, token) if base and token else None
+    # No token in the link: on a phone with the app installed it opens in the
+    # app, which knows its own link (see LAUNCHER_PAGE in reward_server.py).
+    return '%s/#admin-access' % base if base else None
 
 
 def weekly_report(now, token=None):

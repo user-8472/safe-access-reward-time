@@ -308,9 +308,18 @@ or the last one. A warning banner appears at the top of the page if the health m
 problem.
 
 The weekly email lists each kid's or device's internet use, then each person's activity. Its
-**Open Admin Access** button opens the app (the installed app, on a phone) on the recipient's own
-link at Admin Access, to change or turn off emails. It uses `public_url` in `config.json`, which
-the installer sets from your DDNS hostname and port.
+**Open Admin Access** button carries no access token: on a phone with the app installed, it opens
+in the app, which remembers its own link on that device, and goes straight to your row in Admin
+Access, flashing the email settings. On other devices it just asks you to use your own link. The
+button uses `public_url` in `config.json`, which the installer sets from your DDNS hostname and
+port.
+
+### Live updates
+
+While the app is open and on screen, it checks every few seconds whether anything changed: someone
+else's grant, pause, schedule edit or link change, or a change made in the DS Router app. If so, it
+updates and briefly shows a spinning icon in the title bar. It also refreshes quietly every minute,
+and when you return to it, but never while a picker or editor is open or you're typing.
 
 ### Activity
 
