@@ -334,6 +334,10 @@ def get_profiles():
     conn = get_db()
     try:
         now = int(time.time())
+        # Safe Access records time spent per hour (in minutes), in buckets
+        # starting on the hour; today = since local midnight.
+        lt = time.localtime(now)
+        today_start = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
         rows = conn.execute(
             "SELECT profile.id, profile.name "
             "FROM profile JOIN config_group ON config_group.profile_id = profile.id "
@@ -350,6 +354,10 @@ def get_profiles():
             remaining = remaining_row[0]
             remaining_minutes = int((remaining - now) / 60) if remaining else 0
             schedule_state, window_start, window_end = get_schedule_window(conn, profile_id, now)
+            normal_used, reward_used = conn.execute(
+                "SELECT SUM(normal_spent), SUM(reward_spent) FROM config_group_hour_timespent "
+                "WHERE parent_id = ? AND timestamp >= ?", (profile_id, today_start)
+            ).fetchone()
             profiles.append({
                 'id': profile_id,
                 'name': name,
@@ -358,6 +366,8 @@ def get_profiles():
                 'schedule_state': schedule_state,
                 'schedule_window_start': window_start,
                 'schedule_window_end': window_end,
+                'used_today_minutes': (normal_used or 0) + (reward_used or 0),
+                'reward_used_today_minutes': reward_used or 0,
             })
         return profiles
     finally:
@@ -414,6 +424,34 @@ def enqueue_and_wait(action, config_group_id, request_id, timeout=APPLY_TIMEOUT_
             raise RuntimeError(msg or 'apply failed')
         time.sleep(0.1)
     raise RuntimeError('timed out waiting for apply_daemon - is it running?')
+
+
+PENDING_CLEANUP_INTERVAL = 3600
+PENDING_MAX_AGE = 24 * 3600
+_last_pending_cleanup = [0]
+
+
+def cleanup_pending():
+    # Status files whose browser gave up waiting are never read, so they'd
+    # pile up forever. At most once an hour, drop any older than a day.
+    # Request .json files are left alone - apply_daemon owns those.
+    now = time.time()
+    if now - _last_pending_cleanup[0] < PENDING_CLEANUP_INTERVAL:
+        return
+    _last_pending_cleanup[0] = now
+    try:
+        names = os.listdir(PENDING_DIR)
+    except OSError:
+        return
+    for name in names:
+        if not (name.endswith(('.done', '.error', '.status')) or name.endswith('.tmp')):
+            continue
+        path = os.path.join(PENDING_DIR, name)
+        try:
+            if now - os.lstat(path).st_mtime > PENDING_MAX_AGE:
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def get_request_stage(request_id):
@@ -1987,6 +2025,12 @@ function formatWindowEnd(startSeconds, endSeconds) {
     : formatUntil(endSeconds);
 }
 
+function usageText(p) {
+  if (!p.used_today_minutes) return 'No use today';
+  return 'Used today: ' + formatRemaining(p.used_today_minutes) +
+         (p.reward_used_today_minutes ? ' (' + formatRemaining(p.reward_used_today_minutes) + ' reward)' : '');
+}
+
 function scheduleText(p) {
   var start = p.schedule_window_start, end = p.schedule_window_end;
   if (p.schedule_state === 'off') return 'Next scheduled on: ' + formatUntil(start) + ' \u2013 ' + formatWindowEnd(start, end);
@@ -2171,6 +2215,7 @@ function render(profiles) {
     card.innerHTML = '<div class="card-head" data-card-id="' + p.id + '"><div class="name">' + escapeHtml(p.name) + '</div>' + moveBtns + '</div>' +
                       '<div class="remaining" data-remaining="' + p.id + '">' + remainingText + '</div>' +
                       '<div class="schedule">' + scheduleText(p) + '</div>' +
+                      '<div class="schedule">' + usageText(p) + '</div>' +
                       '<div class="btns">' + btns + untilRow + revokeBtnHtml + '</div>';
     el.appendChild(card);
   });
@@ -2766,6 +2811,7 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not self._token_ok(qs):
                 self._send_json({'error': 'forbidden'}, status=403)
                 return
+            cleanup_pending()
             actor = get_actor(self._supplied_token(qs))
             admin = get_admin(self._supplied_token(qs))
             profiles = [p for p in get_profiles() if can_change(actor, p['id'])]
