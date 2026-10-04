@@ -372,8 +372,9 @@ def weekly_report(now, token=None):
                 text.append('    %s: %d' % (label, count))
     text += ['', 'Manage alerts and this weekly email under Admin Access:', link or '(open the app)']
 
-    # Colours from the app: its dark title bar, blue accent, and rounded,
-    # softly shaded blocks; the body stays light so it reads well in mail apps.
+    # Colours from the app: its blue accent and rounded, softly shaded blocks.
+    # The header is outlined in blue rather than the app's dark title bar,
+    # which looked heavy in light-themed mail apps.
     blue, ink, muted, line, soft = '#0a84ff', '#1c1c1e', '#6e6e73', '#e5e5ea', '#f2f2f7'
     # nowrap: on a narrow phone screen the tables scroll or zoom instead of
     # squeezing text onto several lines.
@@ -408,15 +409,15 @@ def weekly_report(now, token=None):
     icon = CONFIG.get('public_url', '').rstrip('/') + '/icon-192.png'
     title = ('<img src="%s" width="34" height="34" alt="" style="display:block;border:0;border-radius:8px">'
              % html_escape(icon))
-    name = '<span style="color:#ffffff;font-size:21px;font-weight:700">Reward Time</span>'
+    name = '<span style="color:%s;font-size:21px;font-weight:700">Reward Time</span>' % ink
     if home:  # the icon and name open the app
         title = '<a href="%s" style="text-decoration:none">%s</a>' % (html_escape(home), title)
         name = '<a href="%s" style="text-decoration:none">%s</a>' % (html_escape(home), name)
     header = (
-        '<table cellpadding="0" cellspacing="0" width="100%%" style="background:#111111;border-radius:12px">'
-        '<tr><td style="padding:14px 16px;width:34px">%s</td>'
-        '<td style="padding:14px 16px 14px 0">%s<div style="color:#b8b8bd;font-size:13px;margin-top:2px">'
-        'Week of %s</div></td></tr></table>' % (title, name, html_escape(period)))
+        '<table cellpadding="0" cellspacing="0" width="100%%" style="border:2px solid %s;border-radius:12px">'
+        '<tr><td style="padding:12px 14px;width:34px">%s</td>'
+        '<td style="padding:12px 14px 12px 0">%s<div style="color:%s;font-size:13px;margin-top:2px">'
+        'Week of %s</div></td></tr></table>' % (blue, title, name, muted, html_escape(period)))
 
     # A one-cell table rather than a padded inline link: Gmail doesn't make
     # room for an inline link's padding, so it overlapped the next line.
@@ -424,17 +425,22 @@ def weekly_report(now, token=None):
               '<td style="background:%s;border-radius:10px">'
               '<a href="%s" style="display:block;padding:12px 18px;color:#ffffff;text-decoration:none;'
               'font-weight:600;white-space:nowrap">Open Admin Access</a></td></tr></table>'
+              # Two short lines: one long line would set the width of the whole
+              # email (it's shrink-to-fit) and stretch the header past the tables.
               '<p style="color:%s;font-size:13px;margin:0">Opens the Reward Time app (the installed app on '
-              'your phone) to change alert emails or turn this weekly email off.</p>'
+              'your phone)<br>to change alert emails or turn this weekly email off.</p>'
               % (blue, html_escape(link), muted)) \
         if link else '<p style="color:%s">Turn this off under Admin Access in the app.</p>' % muted
+    # Everything sits in one shrink-to-fit table, so the header (width 100%%
+    # of it) matches the widest table instead of the whole window.
     html = (
-        '<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,sans-serif;color:%s">%s'
+        '<table cellpadding="0" cellspacing="0" style="font-family:-apple-system,Segoe UI,Roboto,'
+        'Helvetica,sans-serif;color:%s"><tr><td>%s'
         '%s%s<tr><th style="%s">Kid / device</th><th style="%s">Total</th><th style="%s">Reward</th>'
         '<th style="%s">Per day</th></tr>%s</table>'
         '%s%s<tr><th style="%s">Who</th><th style="%s">Grants</th><th style="%s">Revokes</th>'
         '<th style="%s">Pauses</th><th style="%s">Schedules</th><th style="%s">Failed</th></tr>%s</table>'
-        '%s</div>' % (ink, header,
+        '%s</td></tr></table>' % (ink, header,
                       h('Internet use'), table, head, head, head, head, rows_usage,
                       h('Activity', app_link('activity')), table, head, head, head, head, head, head,
                       rows_people, button))
