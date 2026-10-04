@@ -337,12 +337,12 @@ def card_order(token):
         return []
 
 
-def admin_link(token=None):
-    # Opens the app (or the installed web app on a phone) at Admin Access.
+def app_link(section=''):
+    # Opens the app (the installed web app on a phone) - optionally at a
+    # section. No token in the link: the app remembers its own link on that
+    # device (see LAUNCHER_PAGE in reward_server.py).
     base = CONFIG.get('public_url', '').rstrip('/')
-    # No token in the link: on a phone with the app installed it opens in the
-    # app, which knows its own link (see LAUNCHER_PAGE in reward_server.py).
-    return '%s/#admin-access' % base if base else None
+    return '%s/%s' % (base, '#' + section if section else '') if base else None
 
 
 def weekly_report(now, token=None):
@@ -352,7 +352,7 @@ def weekly_report(now, token=None):
     usage.sort(key=lambda u: (order.index(u[0]) if u[0] in order else len(order), u[1]))
     usage = [(name, total, reward) for _, name, total, reward in usage]
     subject = 'Reward Time weekly summary: %s' % period
-    link = admin_link(token)
+    link = app_link('admin-access')
 
     text = ['REWARD TIME - WEEK OF %s' % period.upper(), '', 'INTERNET USE', '-' * 12]
     for name, total, reward in usage:
@@ -372,47 +372,72 @@ def weekly_report(now, token=None):
                 text.append('    %s: %d' % (label, count))
     text += ['', 'Manage alerts and this weekly email under Admin Access:', link or '(open the app)']
 
+    # Colours from the app: its dark title bar, blue accent, and rounded,
+    # softly shaded blocks; the body stays light so it reads well in mail apps.
+    blue, ink, muted, line, soft = '#0a84ff', '#1c1c1e', '#6e6e73', '#e5e5ea', '#f2f2f7'
     # nowrap: on a narrow phone screen the tables scroll or zoom instead of
     # squeezing text onto several lines.
-    cell = 'padding:6px 10px;border-bottom:1px solid #e5e5ea;white-space:nowrap;'
-    head = cell + 'text-align:left;color:#6e6e73;font-weight:600;'
+    cell = 'padding:7px 12px;border-bottom:1px solid %s;white-space:nowrap;' % line
+    head = 'padding:7px 12px;text-align:left;color:%s;font-weight:600;background:%s;white-space:nowrap;' % (muted, soft)
+    table = '<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14px;border:1px solid %s">' % line
+
+    def h(text, url=None):
+        label = html_escape(text) + (' &rsaquo;' if url else '')
+        inner = ('<a href="%s" style="color:%s;text-decoration:none">%s</a>' % (html_escape(url), blue, label)
+                 if url else label)
+        return '<h3 style="margin:26px 0 8px;font-size:17px;color:%s">%s</h3>' % (blue, inner)
+
     rows_usage = ''.join(
         '<tr><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td></tr>' % (
-            cell, html_escape(name), cell, minutes_text(total), cell,
+            cell + 'font-weight:600;', html_escape(name), cell, minutes_text(total), cell,
             minutes_text(reward) if reward else '&ndash;', cell, minutes_text(total // 7))
         for name, total, reward in usage)
     rows_people = ''.join(
         '<tr><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td><td style="%s">%s</td>'
         '<td style="%s">%s</td><td style="%s">%s</td></tr>' % (
-            cell, html_escape(actor) + (' <span style="color:#6e6e73">(babysitter)</span>' if kind == 'guest' else ''),
+            cell + 'font-weight:600;',
+            html_escape(actor) + (' <span style="color:%s;font-weight:400">(babysitter)</span>' % muted
+                                  if kind == 'guest' else ''),
             cell, ('%d &middot; %s' % (grants, minutes_text(minutes))) if grants else '&ndash;',
             cell, revokes or '&ndash;', cell, pauses or '&ndash;', cell, schedules or '&ndash;',
             cell + ('color:#ff3b30;font-weight:600;' if failed else ''), failed or '&ndash;')
         for actor, kind, grants, minutes, revokes, pauses, schedules, failed in people) or \
         '<tr><td style="%s" colspan="6">Nothing this week.</td></tr>' % cell
+
+    home = app_link()
+    icon = CONFIG.get('public_url', '').rstrip('/') + '/icon-192.png'
+    title = ('<img src="%s" width="34" height="34" alt="" style="display:block;border:0;border-radius:8px">'
+             % html_escape(icon))
+    name = '<span style="color:#ffffff;font-size:21px;font-weight:700">Reward Time</span>'
+    if home:  # the icon and name open the app
+        title = '<a href="%s" style="text-decoration:none">%s</a>' % (html_escape(home), title)
+        name = '<a href="%s" style="text-decoration:none">%s</a>' % (html_escape(home), name)
+    header = (
+        '<table cellpadding="0" cellspacing="0" width="100%%" style="background:#111111;border-radius:12px">'
+        '<tr><td style="padding:14px 16px;width:34px">%s</td>'
+        '<td style="padding:14px 16px 14px 0">%s<div style="color:#b8b8bd;font-size:13px;margin-top:2px">'
+        'Week of %s</div></td></tr></table>' % (title, name, html_escape(period)))
+
     # A one-cell table rather than a padded inline link: Gmail doesn't make
     # room for an inline link's padding, so it overlapped the next line.
-    button = ('<table cellpadding="0" cellspacing="0" style="margin:28px 0 12px"><tr>'
-              '<td style="background:#0a84ff;border-radius:10px">'
+    button = ('<table cellpadding="0" cellspacing="0" style="margin:30px 0 12px"><tr>'
+              '<td style="background:%s;border-radius:10px">'
               '<a href="%s" style="display:block;padding:12px 18px;color:#ffffff;text-decoration:none;'
               'font-weight:600;white-space:nowrap">Open Admin Access</a></td></tr></table>'
-              '<p style="color:#6e6e73;font-size:13px;margin:0">Opens the Reward Time app (the installed app on '
-              'your phone) to change alert emails or turn this weekly email off.</p>' % html_escape(link)) \
-        if link else '<p style="color:#6e6e73">Turn this off under Admin Access in the app.</p>'
+              '<p style="color:%s;font-size:13px;margin:0">Opens the Reward Time app (the installed app on '
+              'your phone) to change alert emails or turn this weekly email off.</p>'
+              % (blue, html_escape(link), muted)) \
+        if link else '<p style="color:%s">Turn this off under Admin Access in the app.</p>' % muted
     html = (
-        '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1c1c1e">'
-        '<h2 style="margin:0 0 4px">Reward Time</h2>'
-        '<div style="color:#6e6e73;margin-bottom:20px">Week of %s</div>'
-        '<h3 style="margin:0 0 6px">Internet use</h3>'
-        '<table style="border-collapse:collapse;font-size:14px">'
-        '<tr><th style="%s">Kid / device</th><th style="%s">Total</th><th style="%s">Reward</th>'
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,sans-serif;color:%s">%s'
+        '%s%s<tr><th style="%s">Kid / device</th><th style="%s">Total</th><th style="%s">Reward</th>'
         '<th style="%s">Per day</th></tr>%s</table>'
-        '<h3 style="margin:24px 0 6px">Activity</h3>'
-        '<table style="border-collapse:collapse;font-size:14px">'
-        '<tr><th style="%s">Who</th><th style="%s">Grants</th><th style="%s">Revokes</th>'
+        '%s%s<tr><th style="%s">Who</th><th style="%s">Grants</th><th style="%s">Revokes</th>'
         '<th style="%s">Pauses</th><th style="%s">Schedules</th><th style="%s">Failed</th></tr>%s</table>'
-        '%s</div>' % (html_escape(period), head, head, head, head, rows_usage,
-                      head, head, head, head, head, head, rows_people, button))
+        '%s</div>' % (ink, header,
+                      h('Internet use'), table, head, head, head, head, rows_usage,
+                      h('Activity', app_link('activity')), table, head, head, head, head, head, head,
+                      rows_people, button))
     return subject, '\n'.join(text), html
 
 

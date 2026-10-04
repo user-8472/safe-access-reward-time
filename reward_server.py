@@ -1823,7 +1823,7 @@ PAGE_TEMPLATE = """<!doctype html>
   @keyframes sync-spin { to { transform: rotate(360deg); } }
   @keyframes attention { 0%, 100% { box-shadow: 0 0 0 0 rgba(10,132,255,0); background-color: transparent; }
                          50% { box-shadow: 0 0 0 4px rgba(10,132,255,0.9); background-color: rgba(10,132,255,0.18); } }
-  .attention { animation: attention 0.8s ease-in-out 3; border-radius: 10px; }
+  .attention { animation: attention 0.45s ease-in-out 2; border-radius: 10px; }
   .count-badge { display: inline-block; min-width: 1.4em; padding: 1px 7px; margin-left: 6px; border-radius: 999px;
                  background: #2c2c2e; color: #b8b8bd; font-size: 0.75em; text-align: center; vertical-align: 2px; }
   .count-badge.active { background: #0a84ff; color: #fff; }
@@ -2876,31 +2876,40 @@ document.addEventListener('change', function (e) {
   }
 });
 
-// A link ending in #admin-access (e.g. the weekly email's button) opens your
-// own row in Admin Access - section unfolded, row expanded - scrolls to its
-// alert email / weekly settings and flashes them.
+// Links into a section (e.g. from the weekly email): #admin-access opens your
+// own Admin Access row expanded at its alert email / weekly settings, and
+// #activity opens the Activity section. The section is unfolded if needed,
+// scrolled just below the title bar, and flashed.
 var jumpedToHash = false;
 function jumpToHashSection() {
-  if (jumpedToHash || location.hash !== '#admin-access') return;
+  var hash = location.hash;
+  if (jumpedToHash || (hash !== '#admin-access' && hash !== '#activity')) return;
   jumpedToHash = true;
+  var section = hash === '#activity' ? 'activity' : 'admin';
   var folded = loadFolded();
-  var pos = folded.indexOf('admin');
+  var pos = folded.indexOf(section);
   if (pos !== -1) {
     folded.splice(pos, 1);
     try { localStorage.setItem('rt_folded_sections', JSON.stringify(folded)); } catch (err) {}
     applyFolded();
   }
   var tries = 0;
-  (function waitForRows() {
-    var me = lastAdminLinks.filter(function (a) { return a.is_me; })[0];
-    if (!me && ++tries < 30) { setTimeout(waitForRows, 100); return; }
-    if (me) {
-      expandedAdminLinks[me.token] = true;
-      renderAdminLinks(lastAdminLinks);
+  (function waitForContent() {
+    var target;
+    if (section === 'admin') {
+      var me = lastAdminLinks.filter(function (a) { return a.is_me; })[0];
+      if (!me && ++tries < 30) { setTimeout(waitForContent, 100); return; }
+      if (me) {
+        expandedAdminLinks[me.token] = true;
+        renderAdminLinks(lastAdminLinks);
+        var row = document.querySelector('[data-admin-toggle="' + me.token + '"]');
+        target = row && row.parentNode.querySelector('.guest-row-body');
+      }
+    } else {
+      if (!document.querySelector('#activity-summary tr') && ++tries < 30) { setTimeout(waitForContent, 100); return; }
+      target = document.querySelector('[data-section-body="activity"]');
     }
-    var row = me && document.querySelector('[data-admin-toggle="' + me.token + '"]');
-    var target = row ? row.parentNode.querySelector('.guest-row-body') : null;
-    target = target || document.querySelector('.section-head[data-section="admin"]');
+    target = target || document.querySelector('.section-head[data-section="' + section + '"]');
     if (!target) return;
     // Land just below the sticky title bar, which would otherwise cover it.
     var bar = document.querySelector('h1').offsetHeight;
