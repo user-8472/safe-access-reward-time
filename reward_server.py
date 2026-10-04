@@ -1813,7 +1813,10 @@ PAGE_TEMPLATE = """<!doctype html>
   .sched-links button { background: none; color: #0a84ff; padding: 4px 6px; font-size: 13px; font-weight: 600; width: auto; }
   .sched-chip { display: inline-flex; align-items: center; gap: 6px; background: #2c2c2e; border-radius: 8px;
                 padding: 5px 8px; margin: 6px 6px 0 0; font-size: 14px; }
-  .sched-chip button { background: none; color: #ff453a; padding: 0 2px; font-size: 16px; width: auto; }
+  /* A finger-sized delete target: the padding grows the tap area, and the
+     negative margins tuck it into the chip's own padding so the chip doesn't grow. */
+  .sched-chip button { background: none; color: #ff453a; font-size: 20px; line-height: 1; width: auto;
+                       min-width: 44px; padding: 10px 12px; margin: -5px -8px -5px 0; }
   .sched-none { color: #9b9ba1; font-size: 14px; margin-top: 4px; }
   .btns .sched-btn { grid-column: span 2; background: #2c2c2e; font-size: 15px; }
   .section-head { display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
