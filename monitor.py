@@ -514,10 +514,17 @@ if __name__ == '__main__':
         subject, text, html = weekly_report(int(time.time()))
         print(subject + '\n\n' + text)
         sys.exit(0)
-    if sys.argv[1:] == ['--weekly-now']:
+    if sys.argv[1:2] == ['--weekly-now']:
+        # Sends now - for testing, so it must name who it goes to:
+        #   --weekly-now EMAIL   just that opted-in admin
+        #   --weekly-now --all   everyone opted in (what Sunday does)
         recipients = weekly_recipients()
+        if sys.argv[2:] != ['--all']:
+            if len(sys.argv) != 3:
+                sys.exit('usage: monitor.py --weekly-now EMAIL | --weekly-now --all')
+            recipients = [r for r in recipients if r[0] == sys.argv[2]]
         if not recipients:
-            sys.exit('No admin link has both an alert email and "Weekly usage email" ticked.')
+            sys.exit('No matching admin link has both an alert email and "Weekly usage email" ticked.')
         for email, token in recipients:
             send_mail([email], *weekly_report(int(time.time()), token))
             print('Sent the weekly summary to: %s' % email)
