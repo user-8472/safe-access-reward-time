@@ -414,7 +414,7 @@ def weekly_report(now, token=None):
         title = '<a href="%s" style="text-decoration:none">%s</a>' % (html_escape(home), title)
         name = '<a href="%s" style="text-decoration:none">%s</a>' % (html_escape(home), name)
     header = (
-        '<table cellpadding="0" cellspacing="0" width="100%%" style="border:2px solid %s;border-radius:12px">'
+        '<table cellpadding="0" cellspacing="0" width="100%%" style="border:4px solid %s;border-radius:12px">'
         '<tr><td style="padding:12px 14px;width:34px">%s</td>'
         '<td style="padding:12px 14px 12px 0">%s<div style="color:%s;font-size:13px;margin-top:2px">'
         'Week of %s</div></td></tr></table>' % (blue, title, name, muted, html_escape(period)))
