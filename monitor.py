@@ -17,7 +17,7 @@
 # cert-sync.sh's last result. More can be added in config.json:
 #   "monitor": {
 #     "heartbeats": {"name": "/path/to/heartbeat"},
-#     "status_files": {"name": {"path": "/path/to/status", "max_age": 180}},
+#     "status_files": {"name": {"path": "/path/to/status", "max_age": 300}},
 #     "log_watches": {"name": {"path": "/path/to/log", "pattern": "regex"}}
 #   }
 import json
@@ -43,6 +43,12 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(APP_DIR, 'monitor.state')
 TOKENS_DB_PATH = os.path.join(APP_DIR, 'tokens.db')
 HEARTBEAT_MAX_AGE = 120
+# Right after a boot, files and heartbeats are stale for a while: nothing ran
+# while the router was down, and the router has no clock battery, so jobs that
+# run before NTP sets the time stamp their files 2020-12-31. The nightly
+# scheduled reboot (02:00) leaves them 3-5 minutes stale, so age checks wait
+# until the router has been up this long.
+BOOT_GRACE = 600
 WEB_FAILS_BEFORE_ALERT = 3  # watchdog.sh restarts it within a minute; only a lasting outage alerts
 MAX_QUEUED_ALERTS = 200
 WEEKLY_WEEKDAY = 6   # Sunday (time.localtime: Monday = 0)
@@ -82,6 +88,41 @@ def file_age(path):
         return None
 
 
+def uptime():
+    try:
+        with open('/proc/uptime') as f:
+            return float(f.read().split()[0])
+    except (IOError, ValueError, IndexError):
+        return None
+
+
+def in_boot_grace():
+    up = uptime()
+    return up is not None and up < BOOT_GRACE
+
+
+def fmt_duration(seconds):
+    # 245 -> "4m 05s", 3845 -> "1h 04m 05s", 200000 -> "2d 7h 33m"
+    s = int(max(0, seconds))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return '%dd %dh %02dm' % (d, h, m)
+    if h:
+        return '%dh %02dm %02ds' % (h, m, s)
+    return '%dm %02ds' % (m, s)
+
+
+def fmt_age(age):
+    # A file older than the current boot was written before a restart (and,
+    # if very old, before the clock was set), so its age in years means nothing.
+    up = uptime()
+    if up is not None and age > up:
+        return 'not since the router restarted %s ago' % fmt_duration(up)
+    return fmt_duration(age) + ' ago'
+
+
 def check_web(state):
     code = subprocess.Popen(
         ['curl', '-sk', '-m', '5', '-o', '/dev/null', '-w', '%{http_code}',
@@ -99,8 +140,9 @@ def check_heartbeat(path):
     age = file_age(path)
     if age is None:
         return 'no heartbeat file (%s) - daemon not running?' % path
-    if age > HEARTBEAT_MAX_AGE:
-        return 'heartbeat is %d minutes old - daemon stopped or hung?' % (age // 60)
+    if age > HEARTBEAT_MAX_AGE and not in_boot_grace():
+        return 'last heartbeat %s (limit %s) - daemon stopped or hung?' % (
+            fmt_age(age), fmt_duration(HEARTBEAT_MAX_AGE))
     return None
 
 
@@ -113,8 +155,9 @@ def check_status_file(path, max_age):
     except IOError:
         return None, None
     text = line.split(' ', 2)[2] if line.count(' ') >= 2 else line
-    if max_age and file_age(path) > max_age:
-        return 'last ran %d minutes ago (expected every %d)' % (file_age(path) // 60, max_age // 60), text
+    age = file_age(path)
+    if max_age and age > max_age and not in_boot_grace():
+        return 'last ran %s (limit %s)' % (fmt_age(age), fmt_duration(max_age)), text
     if 'failed' in text.lower():
         return 'last run failed: %s' % text, text
     return None, text
@@ -475,15 +518,19 @@ def main():
     problems, events = run_checks(state)
 
     active = state.get('problems', {})
+    since = state.get('problem_since', {})
     new_alerts = []
     for name, text in sorted(problems.items()):
         if name not in active:
             new_alerts.append('PROBLEM %s: %s' % (name, text))
+            since[name] = now
     for name in sorted(active):
         if name not in problems:
-            new_alerts.append('RECOVERED %s (was: %s)' % (name, active[name]))
+            lasted = ' after %s' % fmt_duration(now - since[name]) if name in since else ''
+            new_alerts.append('RECOVERED %s%s (was: %s)' % (name, lasted, active[name]))
     new_alerts.extend('EVENT ' + e for e in events)
     state['problems'] = problems
+    state['problem_since'] = dict((n, t) for n, t in since.items() if n in problems)
 
     queue = state.get('queue', []) + [[now, a] for a in new_alerts]
     for _, text in [[now, a] for a in new_alerts]:

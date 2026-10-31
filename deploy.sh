@@ -61,7 +61,9 @@ sleep 1
 sleep 3
 PORT=$(python -c "import json; print(json.load(open('config.json'))['port'])")
 CODE=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "https://localhost:$PORT/")
-NEW_CRASH=$(tail -c +$((CRASH_BEFORE + 1)) server.crash.log 2>/dev/null | grep -v 'watchdog: starting' || true)
+# Only what was appended since the restart. (BusyBox 1.16's tail -c +N ignores
+# large N and prints the last ~600KB, so seek with Python instead.)
+NEW_CRASH=$(python -c "import sys; f = open('server.crash.log'); f.seek($CRASH_BEFORE); sys.stdout.write(f.read())" 2>/dev/null | grep -v 'watchdog: starting' || true)
 if [ "$CODE" = "000" ] || [ -n "$NEW_CRASH" ]; then
   echo "SERVER NOT HEALTHY (HTTP $CODE)"; [ -n "$NEW_CRASH" ] && echo "$NEW_CRASH"
   echo "to roll back: cp -p backups/$TS/* . && ./watchdog.sh"
