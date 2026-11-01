@@ -89,10 +89,17 @@ def get_tokens_db():
     # Babysitter links can be limited to some profiles: a JSON list of profile
     # ids, or NULL for all of them (the default, and every link made before
     # this column existed).
-    # Opt-in to monitor.py's Sunday usage summary (needs an alert email too).
+    # Opt-in to monitor.py's Sunday usage summary (needs an email too).
     admin_columns = [row[1] for row in conn.execute("PRAGMA table_info(admin_tokens)")]
     if 'weekly' not in admin_columns:
         conn.execute("ALTER TABLE admin_tokens ADD COLUMN weekly INTEGER NOT NULL DEFAULT 0")
+    # Opt-in to monitor.py's alert emails (router problems, failed actions),
+    # separate from the weekly summary. Links that already had an email got
+    # alerts before this column existed, so they keep them.
+    if 'alerts' not in admin_columns:
+        conn.execute("ALTER TABLE admin_tokens ADD COLUMN alerts INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE admin_tokens SET alerts = 1 WHERE email IS NOT NULL AND email != ''")
+        conn.commit()
     # Card order (JSON list of profile ids), per admin, so it matches on every
     # device they use; order_updated picks the fallback for everyone else.
     if 'card_order' not in admin_columns:
@@ -143,10 +150,10 @@ def list_admin_tokens():
     conn = get_tokens_db()
     try:
         rows = conn.execute(
-            "SELECT token, label, email, weekly FROM admin_tokens ORDER BY created_at"
+            "SELECT token, label, email, weekly, alerts FROM admin_tokens ORDER BY created_at"
         ).fetchall()
-        return [{'token': t, 'label': label, 'email': email or '', 'weekly': bool(weekly)}
-                for t, label, email, weekly in rows]
+        return [{'token': t, 'label': label, 'email': email or '', 'weekly': bool(weekly), 'alerts': bool(alerts)}
+                for t, label, email, weekly, alerts in rows]
     finally:
         conn.close()
 
@@ -200,10 +207,13 @@ def set_card_order(token, ids):
         conn.close()
 
 
-def set_admin_weekly(token, weekly):
+def set_admin_flag(token, column, on):
+    # column: 'weekly' (Sunday summary) or 'alerts' (alert emails).
+    if column not in ('weekly', 'alerts'):
+        raise ValueError('unknown setting')
     conn = get_tokens_db()
     try:
-        conn.execute("UPDATE admin_tokens SET weekly = ? WHERE token = ?", (1 if weekly else 0, token))
+        conn.execute("UPDATE admin_tokens SET %s = ? WHERE token = ?" % column, (1 if on else 0, token))
         conn.commit()
     finally:
         conn.close()
@@ -231,7 +241,7 @@ def get_version():
         parts.append(conn.execute("SELECT MAX(id) FROM activity").fetchone())
         parts.append(conn.execute("SELECT COUNT(*), MAX(created_at), MAX(expires_at) FROM guest_tokens").fetchone())
         parts.append(conn.execute(
-            "SELECT COUNT(*), GROUP_CONCAT(label || ':' || IFNULL(email, '') || ':' || weekly || ':' || "
+            "SELECT COUNT(*), GROUP_CONCAT(label || ':' || IFNULL(email, '') || ':' || weekly || ':' || alerts || ':' || "
             "IFNULL(card_order, '')) FROM admin_tokens").fetchone())
     finally:
         conn.close()
@@ -2727,12 +2737,15 @@ function renderAdminLinks(admins) {
            '</div></div>' +
            '<div class="guest-row-body"><input class="guest-url-field" readonly ' +
            'onclick="this.select()" value="' + escapeHtml(guestUrl(a.token)) + '">' +
-           '<div class="admin-email-row"><input class="guest-url-field" type="email" placeholder="Alert email (optional)" ' +
+           '<div class="admin-email-row"><input class="guest-url-field" type="email" placeholder="Email (optional)" ' +
            'data-admin-email="' + a.token + '" value="' + escapeHtml(email) + '">' +
            '<button class="copy-guest" data-save-admin-email="' + a.token + '">Save</button></div>' +
+           '<label class="weekly-opt' + (a.email ? '' : ' disabled') + '"><input type="checkbox" data-alerts-admin="' + a.token + '"' +
+           (a.alerts ? ' checked' : '') + (a.email ? '' : ' disabled') + '>Alert emails (router problems, failed actions)' +
+           (a.email ? '' : ' &ndash; needs an email') + '</label>' +
            '<label class="weekly-opt' + (a.email ? '' : ' disabled') + '"><input type="checkbox" data-weekly-admin="' + a.token + '"' +
            (a.weekly ? ' checked' : '') + (a.email ? '' : ' disabled') + '>Weekly usage email (Sundays)' +
-           (a.email ? '' : ' &ndash; needs an alert email') + '</label>' +
+           (a.email ? '' : ' &ndash; needs an email') + '</label>' +
            (a.is_me ? '' : '<button class="revoke-guest row-revoke" data-revoke-admin="' + a.token + '">Revoke</button>') +
            '</div>' +
            '</div>';
@@ -2816,8 +2829,9 @@ function describeActivity(e) {
     case 'guest_link_revoked': return 'revoked babysitter link ' + escapeHtml(e.detail || '');
     case 'admin_link_created': return 'created admin link ' + escapeHtml(e.detail || '');
     case 'admin_link_revoked': return 'revoked admin link ' + escapeHtml(e.detail || '');
-    case 'admin_alert_email_set': return 'alert email for ' + escapeHtml(e.detail || '');
+    case 'admin_alert_email_set': return 'email for ' + escapeHtml(e.detail || '');
     case 'admin_weekly_email_set': return 'weekly email for ' + escapeHtml(e.detail || '');
+    case 'admin_alert_emails_set': return 'alert emails for ' + escapeHtml(e.detail || '');
     default: return escapeHtml(e.action) + ' ' + who;
   }
 }
@@ -2879,13 +2893,20 @@ document.addEventListener('change', function (e) {
       .catch(function (err) { box.checked = !box.checked; toast(err.message || 'Failed - check connection'); });
     return;
   }
+  if (e.target.dataset && e.target.dataset.alertsAdmin) {
+    var abox = e.target;
+    adminPost('/api/admins/set_alerts', { admin_token: abox.dataset.alertsAdmin, alerts: abox.checked ? '1' : '0' })
+      .then(function () { toast(abox.checked ? 'Alert emails on' : 'Alert emails off'); loadAdminLinks(); loadActivity(); })
+      .catch(function (err) { abox.checked = !abox.checked; toast(err.message || 'Failed - check connection'); });
+    return;
+  }
   if (e.target.id === 'scope-all') {
     document.getElementById('scope-list').style.display = e.target.checked ? 'none' : '';
   }
 });
 
 // Links into a section (e.g. from the weekly email): #admin-access opens your
-// own Admin Access row expanded at its alert email / weekly settings, and
+// own Admin Access row expanded at its email settings, and
 // #activity opens the Activity section. The section is unfolded if needed,
 // scrolled just below the title bar, and flashed.
 var jumpedToHash = false;
@@ -3883,7 +3904,7 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             return
 
         if parsed.path in ('/api/admins/create', '/api/admins/set_email', '/api/admins/set_weekly',
-                           '/api/admins/revoke'):
+                           '/api/admins/set_alerts', '/api/admins/revoke'):
             me = self._supplied_token(qs)
             if not is_admin_token(me):
                 self._send_json({'error': 'forbidden'}, status=403)
@@ -3908,13 +3929,18 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             target_label = ([a['label'] for a in list_admin_tokens() if a['token'] == target] or ['?'])[0]
             if parsed.path == '/api/admins/set_weekly':
                 weekly = qs.get('weekly', [''])[0] == '1'
-                set_admin_weekly(target, weekly)
+                set_admin_flag(target, 'weekly', weekly)
                 record_activity(get_actor(me), 'admin_weekly_email_set',
                                 detail='%s: %s' % (target_label, 'on' if weekly else 'off'))
+            elif parsed.path == '/api/admins/set_alerts':
+                alerts = qs.get('alerts', [''])[0] == '1'
+                set_admin_flag(target, 'alerts', alerts)
+                record_activity(get_actor(me), 'admin_alert_emails_set',
+                                detail='%s: %s' % (target_label, 'on' if alerts else 'off'))
             elif parsed.path == '/api/admins/set_email':
                 set_admin_email(target, email)
                 record_activity(get_actor(me), 'admin_alert_email_set',
-                                detail='%s: %s' % (target_label, email or 'alerts off'))
+                                detail='%s: %s' % (target_label, email or 'removed'))
             else:
                 if target == me:
                     self._send_json({'error': "You can't revoke your own link"}, status=400)

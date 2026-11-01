@@ -9,7 +9,7 @@
 # activity log that failed). It also sends the weekly usage summary (Sundays
 # from WEEKLY_HOUR) to admin links that opted in. Alerts are always
 # written to monitor.log and, when email is configured (see send_email), to
-# every admin link that has an alert email. Alerts that couldn't be emailed
+# every admin link with an email that ticked "Alert emails". Alerts that couldn't be emailed
 # stay queued and are retried on the next run. The current set of problems
 # is kept in monitor.state, which the app reads to show a warning banner.
 #
@@ -235,7 +235,9 @@ def run_checks(state):
         problem, text = check_status_file(spec['path'], spec.get('max_age', 0))
         if problem:
             problems[name] = problem
-        if text and 'forced update' in text and text != last_status.get(name):
+        # One-off happenings worth an email: a forced DDNS update, or the block
+        # page patch put back after a Safe Access update.
+        if text and ('forced update' in text or 're-applied' in text) and text != last_status.get(name):
             events.append('%s: %s' % (name, text))
         if text:
             last_status[name] = text
@@ -264,11 +266,10 @@ def weekly_recipients():
 
 
 def alert_recipients(weekly=False):
-    # Admin links with an alert email (managed on the app's admin page); for
-    # the weekly summary, only those that also ticked "Weekly usage email".
-    query = "SELECT email FROM admin_tokens WHERE email IS NOT NULL AND email != ''"
-    if weekly:
-        query += " AND weekly = 1"
+    # Admin links with an email (managed under Admin Access) that ticked
+    # "Alert emails", or for the weekly summary, "Weekly usage email".
+    query = "SELECT email FROM admin_tokens WHERE email IS NOT NULL AND email != '' AND %s = 1" % (
+        'weekly' if weekly else 'alerts')
     try:
         conn = sqlite3.connect(TOKENS_DB_PATH, timeout=10)
         try:
@@ -553,7 +554,7 @@ def test_email():
         print('No "smtp" section in config.json - run set-alert-email.sh first.')
         return 1
     if not recipients:
-        print('No admin link has an alert email - add one on the admin page.')
+        print('No admin link has an email with "Alert emails" ticked - set one under Admin Access.')
         return 1
     send_email(recipients, [[int(time.time()), 'Test alert - email alerts are working']])
     print('Sent a test alert to: %s' % ', '.join(recipients))
@@ -577,7 +578,7 @@ if __name__ == '__main__':
                 sys.exit('usage: monitor.py --weekly-now EMAIL | --weekly-now --all')
             recipients = [r for r in recipients if r[0] == sys.argv[2]]
         if not recipients:
-            sys.exit('No matching admin link has both an alert email and "Weekly usage email" ticked.')
+            sys.exit('No matching admin link has both an email and "Weekly usage email" ticked.')
         for email, token in recipients:
             send_mail([email], *weekly_report(int(time.time()), token))
             print('Sent the weekly summary to: %s' % email)

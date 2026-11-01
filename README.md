@@ -79,9 +79,11 @@ this app avoids it.
   some devices. Babysitters can grant, revoke and pause, but can't create links or see the admin
   sections.
 - **Activity log:** who did what and when, with per-person weekly and monthly totals.
-- **Email alerts and a weekly summary:** a health monitor emails each admin who set an alert address
+- **Email alerts and a weekly summary:** a health monitor emails each admin who opted in to alerts
   when something breaks (and when it recovers) or an action fails, and optionally a Sunday summary
-  of the week's usage.
+  of the week's usage. Each is a separate checkbox per admin.
+- **A useful block page (optional):** blocked devices see their name, IP, MAC address, profile and
+  next allowed time instead of Safe Access's generic page, at a fraction of the CPU cost.
 - **Runs unattended:** watchdogs check real health every minute and restart things, and it survives
   router reboots.
 
@@ -219,8 +221,8 @@ brand/model, so check that router's own documentation.
 6. Optional, for email alerts and the weekly summary: create a Gmail *app password*
    (Google account -> Security -> 2-Step Verification -> App passwords) and run
    `./set-alert-email.sh` from the app directory. It stores the sender and sends a test. Then
-   set an alert email on your admin link (Admin Access on the page) and tick
-   "Weekly usage email" if you want the Sunday summary.
+   set an email on your admin link (Admin Access on the page) and tick "Alert emails" and/or
+   "Weekly usage email".
 
 Since it's a self-signed certificate by default, your browser will warn you
 the first time. You can just tap through it, or - to make the warning go
@@ -305,7 +307,8 @@ badge on the heading shows how many are active; open a row to see its link again
 ### Admin access and alerts
 
 Every admin link has a name, which is what Activity shows. Open a row to copy its link, set an
-alert email, tick **Weekly usage email (Sundays)**, or revoke it. You can't revoke your own link,
+email, tick **Alert emails** (router problems and failed actions) and/or **Weekly usage email
+(Sundays)**, or revoke it. You can't revoke your own link,
 or the last one. A warning banner appears at the top of the page if the health monitor sees a
 problem.
 
@@ -316,6 +319,26 @@ in the app, which remembers its own link on that device, and goes straight to yo
 Access, flashing the email settings. On other devices it just asks you to use your own link. The
 button uses `public_url` in `config.json`, which the installer sets from your DDNS hostname and
 port.
+
+### Block page
+
+Safe Access shows blocked devices a generic "No Internet connection!" page, built by a root CGI
+that takes about half a second of CPU per request. A TV left on a streaming app asks about once a
+second, which kept a dual-core router around 40% busy. The optional replacement in
+`root/blockpage/` shows each blocked device its name, IP and MAC address (handy for finding a new
+device to add to a profile), its profile, and why it's blocked: outside scheduled time (with the
+next allowed time), paused (and until when), or no scheduled time at all.
+
+It's a small shell CGI that prints a ready-made page per device, about 13 ms; `build_page.py`
+rebuilds a device's page only when that device asks and its page is over a minute old or older than
+the last Safe Access change, so idle devices cost nothing. The only Synology file changed is the
+schedule block page's `.htaccess` (its rewrite target). `blockpage_patch.py` runs from root's cron
+every 5 minutes: it re-applies the change if a Safe Access update restores the original
+`.htaccess` (the monitor emails that as an event), and if the files change into anything it doesn't
+recognize, it leaves them alone and reports a problem. `blockpage_patch.py --remove` restores
+Synology's page. Install it as root: copy its three files (plus `schedule.py`) into
+`<root dir>/blockpage/` with `__ROOT_DIR__` filled in, run `blockpage_patch.py --install`, and add
+the cron line.
 
 ### Live updates
 
@@ -402,7 +425,7 @@ Around that:
 - **The server keeps restarting**: `server.crash.log` has startup errors and
   tracebacks, plus a line for every restart. `server.log` is the request log.
 - **No alert emails**: run `python monitor.py --test-email` in the app
-  directory. Check the admin link has an alert email set, and that
+  directory. Check the admin link has an email set and "Alert emails" ticked, and that
   `set-alert-email.sh` was given a Gmail *app password*, not the account
   password.
 
