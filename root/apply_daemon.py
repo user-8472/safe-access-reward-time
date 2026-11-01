@@ -48,8 +48,32 @@ _handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
 log.addHandler(_handler)
 
 
+SLOW_API_SECONDS = 3
+
+
+def run_api(args):
+    # Every Safe Access call is a separate synowebapi process, normally ~1 s.
+    # Log the slow ones, so a request that misses the app's wait shows why.
+    start = time.time()
+    try:
+        return subprocess.check_output(args)
+    finally:
+        took = time.time() - start
+        if took >= SLOW_API_SECONDS:
+            log.info('slow synowebapi call (%.1fs): %s', took,
+                     ' '.join(a for a in args[2:5] if not a.startswith('ultra_rewards=')))
+
+
+def request_age(path):
+    # Seconds since the app queued this request (the file's mtime).
+    try:
+        return time.time() - os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
 def get_current_reward(config_group_id):
-    out = subprocess.check_output([
+    out = run_api([
         SYNOWEBAPI, '--exec', 'api=%s' % API, 'method=get', 'version=1',
         'config_group_id=%d' % config_group_id
     ])
@@ -67,14 +91,14 @@ def get_current_reward(config_group_id):
 
 def set_reward(config_group_id, available, expired):
     payload = json.dumps([{'available': available, 'expired': expired}])
-    subprocess.check_output([
+    run_api([
         SYNOWEBAPI, '--exec', 'api=%s' % API, 'method=set', 'version=1',
         'config_group_id=%d' % config_group_id, 'ultra_rewards=%s' % payload
     ])
 
 
 def set_pause(config_group_id, paused):
-    subprocess.check_output([
+    run_api([
         SYNOWEBAPI, '--exec', 'api=%s' % PAUSE_API, 'method=set', 'version=1',
         'config_group_id=%d' % config_group_id, 'pause=%s' % ('true' if paused else 'false')
     ])
@@ -142,7 +166,7 @@ def process_schedule(path, base, req):
     try:
         write_stage(base, 'applying')
         blocktimes = check_blocktimes(req.get('blocktimes'))
-        out = subprocess.check_output([
+        out = run_api([
             SYNOWEBAPI, '--exec', 'api=%s' % SCHEDULE_API, 'method=set', 'version=1',
             'profile_id=%d' % profile_id, 'blocktimes=%s' % json.dumps(blocktimes)
         ])
@@ -194,13 +218,14 @@ def write_stage(base, stage):
 
 
 def finish_ok(path, base, action, cgid):
+    age = request_age(path)
     os.remove(path)
     try:
         os.remove(base + '.status')
     except OSError:
         pass
     write_marker(base + '.done', '')
-    log.info('%s config_group_id=%s -> ok', action, cgid)
+    log.info('%s config_group_id=%s -> ok (%.1fs after request)', action, cgid, age)
 
 
 def finish_error(path, base, exc):

@@ -472,7 +472,9 @@ PENDING_DIR = os.path.join(APP_DIR, 'pending')
 # *different* profiles still queue up as separate pairs processed one after
 # another - this leaves some headroom for that case rather than the bare
 # minimum for a single request.
-APPLY_TIMEOUT_SECONDS = 10
+# apply_daemon normally confirms in 1-2 s (each Safe Access call is ~1 s), but
+# the router is sometimes busy enough that it takes over 10 s.
+APPLY_TIMEOUT_SECONDS = 30
 REQUEST_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 TOKEN_REDACT_RE = re.compile(r'(token=)[^&\s"]+')
 
@@ -515,6 +517,9 @@ def enqueue_and_wait(action, config_group_id, request_id, timeout=APPLY_TIMEOUT_
             os.remove(error_path)
             raise RuntimeError(msg or 'apply failed')
         time.sleep(0.1)
+    if os.path.exists(os.path.join(PENDING_DIR, base + '.status')):
+        raise RuntimeError('apply_daemon started this but has not confirmed it after %ds - '
+                           'it may still go through; refresh to check' % timeout)
     raise RuntimeError('timed out waiting for apply_daemon - is it running?')
 
 
