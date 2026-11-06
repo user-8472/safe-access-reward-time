@@ -13,7 +13,7 @@ set -e
 HOST=${1:-${DEPLOY_HOST:-synology}}
 APP_DIR=${2:-${DEPLOY_APP_DIR:-/volume1/reward-time}}
 KEEP=${KEEP:-5}
-FILES="reward_server.py schedule.py monitor.py set-alert-email.sh"
+FILES="reward_server.py schedule.py device_lookup.py monitor.py set-alert-email.sh"
 cd "$(dirname "$0")"
 
 echo "== deploying to $HOST:$APP_DIR"

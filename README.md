@@ -82,6 +82,8 @@ this app avoids it.
 - **Email alerts and a weekly summary:** a health monitor emails each admin who opted in to alerts
   when something breaks (and when it recovers) or an action fails, and optionally a Sunday summary
   of the week's usage. Each is a separate checkbox per admin.
+- **"My device" page for the kids:** anyone at home can open `/me` (no link or token needed) to see
+  their own device's reward time counting down, today's use and the coming week's schedule.
 - **A useful block page (optional):** blocked devices see their name, IP, MAC address, profile and
   next allowed time instead of Safe Access's generic page, at a fraction of the CPU cost.
 - **Runs unattended:** watchdogs check real health every minute and restart things, and it survives
@@ -319,6 +321,16 @@ in the app, which remembers its own link on that device, and goes straight to yo
 Access, flashing the email settings. On other devices it just asks you to use your own link. The
 button uses `public_url` in `config.json`, which the installer sets from your DDNS hostname and
 port.
+
+### My device page
+
+`https://<your-host>:<port>/me` needs no token. It works out which device is asking from the
+request's address (LAN address -> MAC from the router's address table or DHCP leases -> the name
+and Safe Access profile the DS router app shows) and shows only that device: reward time counting
+down, scheduled time or the next allowed window, pauses, today's use, the next seven days of
+allowed times, and its name, IP and MAC. It refreshes every 30 seconds while open and is read-only.
+Requests from outside the home network get a 404. (The router keeps the client's own address even
+when it connects through the public DDNS name, so the same URL works at home.)
 
 ### Block page
 

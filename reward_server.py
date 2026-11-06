@@ -19,6 +19,7 @@ import time
 import urllib
 import urlparse
 
+from device_lookup import identify, lan_ipv4
 from schedule import (get_schedule_window, on_windows_from_blocks, blocks_from_on_windows,
                       validate_on_windows)
 
@@ -588,6 +589,25 @@ def set_expiry(profile_id, expires_at, request_id):
 
 def revoke_time(profile_id, request_id):
     enqueue_and_wait('revoke', profile_id, request_id)
+
+
+def my_device_status(ip):
+    # What the /me page shows for the device at this LAN address.
+    conn = get_db()
+    try:
+        info = identify(ip, conn)
+        row = conn.execute("SELECT enable_blocktime FROM profile WHERE id = ?",
+                           (info['profile_id'],)).fetchone() if info['profile_id'] is not None else None
+    finally:
+        conn.close()
+    # Profiles with Safe Access's schedule turned off (e.g. parents') have no limits.
+    no_schedule = bool(row) and not row[0]
+    status = {'device': info, 'now': int(time.time()), 'profile': None, 'days': None,
+              'no_schedule': no_schedule}
+    if info['profile_id'] is not None and not no_schedule:
+        status['profile'] = ([p for p in get_profiles() if p['id'] == info['profile_id']] or [None])[0]
+        status['days'] = get_on_windows(info['profile_id'])
+    return status
 
 
 def get_on_windows(profile_id):
@@ -1693,6 +1713,181 @@ self.addEventListener('fetch', function(e) { e.respondWith(fetch(e.request)); })
 # installed, the link opens in the app, which remembered its own link on that
 # device; this page continues to it (keeping #section). Nothing is revealed to
 # anyone else.
+# The tokenless "My device" page: anyone on the home network can open /me to
+# see their own device's reward time, today's use and the coming week's
+# schedule. Which device is worked out from the request's address
+# (device_lookup.py); requests from outside the LAN get a 404. Read-only.
+MY_DEVICE_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My device - Reward Time</title>
+<link rel="icon" href="/icon.svg">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #111;
+         color: #eee; margin: 0; }
+  main { max-width: 480px; margin: 0 auto; padding: 20px 16px 32px; }
+  h1 { font-size: 22px; margin: 0 0 2px; }
+  .sub { color: #8e8e93; font-size: 14px; margin: 0 0 16px; }
+  .card { background: #1c1c1e; border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .big { font-size: 30px; font-weight: 700; color: #0a84ff; margin: 0; }
+  .big.off { color: #ff9f0a; }
+  .label { color: #8e8e93; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; margin: 0 0 6px; }
+  .line { margin: 6px 0 0; color: #d1d1d6; line-height: 1.4; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 8px 0; border-top: 1px solid #2c2c2e; vertical-align: top; }
+  tr:first-child td { border-top: none; }
+  td:first-child { color: #8e8e93; width: 38%; padding-right: 10px; }
+  tr.today td { color: #fff; font-weight: 600; }
+  tr.today td:first-child { color: #0a84ff; }
+  .none { color: #6e6e73; }
+  .mono { word-break: break-all; }
+  .foot { color: #6e6e73; font-size: 12px; text-align: center; }
+</style></head>
+<body><main>
+<h1 id="name">My device</h1>
+<p class="sub" id="profile">&nbsp;</p>
+<div class="card"><p class="label">Right now</p><p class="big" id="now">&hellip;</p><div id="now-lines"></div></div>
+<div class="card" id="used-card" hidden><p class="label">Used today</p><p class="line" id="used"></p></div>
+<div class="card" id="week-card" hidden><p class="label">Scheduled time</p><table id="week"></table></div>
+<div class="card"><p class="label">This device</p><table id="device"></table></div>
+<p class="foot" id="foot"></p>
+</main>
+<script>
+var data = null, fetchedAt = 0;
+var DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+  });
+}
+function clock(ts) {
+  var d = new Date(ts * 1000), h = d.getHours(), m = d.getMinutes();
+  return (h % 12 || 12) + ':' + (m < 10 ? '0' : '') + m + ' ' + (h < 12 ? 'AM' : 'PM');
+}
+function minuteClock(min) {
+  if (min >= 1440) return 'midnight';
+  var h = Math.floor(min / 60), m = min % 60;
+  return (h % 12 || 12) + ':' + (m < 10 ? '0' : '') + m + ' ' + (h < 12 ? 'AM' : 'PM');
+}
+function dayName(ts) {
+  var d = new Date(ts * 1000), t = new Date();
+  var days = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()) -
+                         new Date(t.getFullYear(), t.getMonth(), t.getDate())) / 86400000);
+  return days === 0 ? 'today' : days === 1 ? 'tomorrow' : DAYS[d.getDay()];
+}
+function when(ts) { return dayName(ts) + ' ' + clock(ts); }
+function duration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if (h) return h + 'h ' + (m < 10 ? '0' : '') + m + 'm';
+  return m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+}
+function minutes(n) {
+  n = n || 0;
+  return n >= 60 ? Math.floor(n / 60) + 'h ' + (n % 60) + 'm' : n + 'm';
+}
+
+function renderNow() {
+  if (!data) return;
+  var p = data.profile, d = data.device;
+  var big = document.getElementById('now'), lines = [];
+  var now = data.now + (Date.now() - fetchedAt) / 1000;
+  big.className = 'big';
+  if (!d.mac) {
+    big.textContent = 'Not recognized';
+    big.className = 'big off';
+    lines.push("Couldn't match this device's address to one on the network. Try again in a minute.");
+  } else if (!d.profile_id) {
+    big.textContent = 'No limits set';
+    lines.push("This device isn't in a Safe Access profile. Ask a parent to add it in the DS router app " +
+               '- the name and MAC address below identify it.');
+  } else if (data.no_schedule) {
+    big.textContent = 'Internet on';
+    lines.push('This profile has no schedule limits.');
+  } else if (!p) {
+    big.textContent = 'Not tracked';
+    lines.push('Reward Time doesn\\'t show this profile.');
+  } else if (p.paused) {
+    big.textContent = 'Paused';
+    big.className = 'big off';
+    lines.push(p.paused_until ? 'Internet is paused until ' + when(p.paused_until) + '.'
+                              : 'Internet is paused, with no end time set.');
+  } else if (p.expires_at && p.expires_at > now) {
+    big.textContent = duration(p.expires_at - now) + ' reward time';
+    lines.push('Reward time lasts until ' + when(p.expires_at) + '.');
+  } else if (p.schedule_state === 'on') {
+    big.textContent = 'Scheduled time';
+    lines.push('Internet is on until ' + when(p.schedule_window_end) + '.');
+  } else if (p.schedule_state === 'always_on') {
+    big.textContent = 'Internet on';
+    lines.push('No schedule limits.');
+  } else {
+    big.textContent = 'No internet now';
+    big.className = 'big off';
+  }
+  if (p && !p.paused && d.profile_id) {
+    if (p.schedule_state === 'off')
+      lines.push('Next scheduled time: ' + when(p.schedule_window_start) + ' to ' +
+                 (dayName(p.schedule_window_end) === dayName(p.schedule_window_start)
+                  ? clock(p.schedule_window_end) : when(p.schedule_window_end)) + '.');
+    else if (p.schedule_state === 'always_off')
+      lines.push('No scheduled time - internet only with reward time from a parent.');
+    else if (p.schedule_state === 'on' && p.expires_at && p.expires_at > now)
+      lines.push('Scheduled time until ' + when(p.schedule_window_end) + '.');
+  }
+  document.getElementById('now-lines').innerHTML =
+    lines.map(function (l) { return '<p class="line">' + esc(l) + '</p>'; }).join('');
+}
+
+function render() {
+  var d = data.device, p = data.profile;
+  document.getElementById('name').textContent = d.name || 'My device';
+  document.getElementById('profile').textContent = d.profile_name ? 'Profile: ' + d.profile_name : '';
+  renderNow();
+
+  document.getElementById('used-card').hidden = !p;
+  if (p) document.getElementById('used').textContent = minutes(p.used_today_minutes) +
+    (p.reward_used_today_minutes ? ' (' + minutes(p.reward_used_today_minutes) + ' of it reward time)' : '');
+
+  document.getElementById('week-card').hidden = !data.days;
+  if (data.days) {
+    var today = new Date().getDay(), rows = '';
+    for (var i = 0; i < 7; i++) {
+      var day = (today + i) % 7, wins = data.days[day] || [];
+      var text = wins.length ? wins.map(function (w) {
+        return w[0] === 0 && w[1] >= 1440 ? 'All day' : minuteClock(w[0]) + ' - ' + minuteClock(w[1]);
+      }).join('<br>') : '<span class="none">No scheduled time</span>';
+      rows += '<tr' + (i === 0 ? ' class="today"' : '') + '><td>' +
+              (i === 0 ? 'Today' : i === 1 ? 'Tomorrow' : DAYS[day]) + '</td><td>' + text + '</td></tr>';
+    }
+    document.getElementById('week').innerHTML = rows;
+  }
+
+  var rowsD = [['Name', d.name || 'unknown'], ['Profile', d.profile_name || 'none'],
+               ['IP address', d.ip], ['MAC address', d.mac || 'unknown']];
+  if (d.type) rowsD.push(['Type', d.type]);
+  document.getElementById('device').innerHTML = rowsD.map(function (r) {
+    return '<tr><td>' + esc(r[0]) + '</td><td class="mono">' + esc(r[1]) + '</td></tr>';
+  }).join('');
+  document.getElementById('foot').textContent = 'Reward Time \\u00b7 updated ' + clock(data.now);
+}
+
+function load() {
+  fetch('/api/me', {cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (j) {
+    data = j; fetchedAt = Date.now(); render();
+  }).catch(function () {
+    document.getElementById('foot').textContent = "Couldn't refresh - check the connection";
+  });
+}
+load();
+setInterval(function () { if (!document.hidden) load(); }, 30000);
+setInterval(function () { if (!document.hidden) renderNow(); }, 1000);
+document.addEventListener('visibilitychange', function () { if (!document.hidden) load(); });
+</script>
+</body></html>
+"""
+
+
 LAUNCHER_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reward Time</title>
@@ -3563,6 +3758,19 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if parsed.path in ('/me', '/api/me'):
+            # No token: only for devices on the home network, and only about
+            # the device asking.
+            ip = lan_ipv4(self.client_address[0])
+            if not ip:
+                self._send_html('<h1>Not found</h1>', status=404)
+                return
+            if parsed.path == '/me':
+                self._send_html(MY_DEVICE_PAGE)
+            else:
+                self._send_json(my_device_status(ip))
             return
 
         if parsed.path == '/':
