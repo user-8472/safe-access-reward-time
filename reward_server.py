@@ -1779,8 +1779,9 @@ function when(ts) { return dayName(ts) + ' ' + clock(ts); }
 function duration(sec) {
   sec = Math.max(0, Math.round(sec));
   var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
-  if (h) return h + 'h ' + (m < 10 ? '0' : '') + m + 'm';
-  return m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+  var ss = (s < 10 ? '0' : '') + s + 's';
+  if (h) return h + 'h ' + (m < 10 ? '0' : '') + m + 'm ' + ss;
+  return m + 'm ' + ss;
 }
 function minutes(n) {
   n = n || 0;

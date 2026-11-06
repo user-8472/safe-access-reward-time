@@ -339,7 +339,8 @@ that takes about half a second of CPU per request. A TV left on a streaming app 
 second, which kept a dual-core router around 40% busy. The optional replacement in
 `root/blockpage/` shows each blocked device its name, IP and MAC address (handy for finding a new
 device to add to a profile), its profile, and why it's blocked: outside scheduled time (with the
-next allowed time), paused (and until when), or no scheduled time at all.
+next allowed time), paused (and until when), or no scheduled time at all, with a link to the
+`/me` page.
 
 It's a small shell CGI that prints a ready-made page per device, about 13 ms; `build_page.py`
 rebuilds a device's page only when that device asks and its page is over a minute old or older than
@@ -349,7 +350,7 @@ every 5 minutes: it re-applies the change if a Safe Access update restores the o
 `.htaccess` (the monitor emails that as an event), and if the files change into anything it doesn't
 recognize, it leaves them alone and reports a problem. `blockpage_patch.py --remove` restores
 Synology's page. Install it as root: copy its three files (plus `schedule.py`) into
-`<root dir>/blockpage/` with `__ROOT_DIR__` filled in, run `blockpage_patch.py --install`, and add
+`<root dir>/blockpage/` with `__ROOT_DIR__` and `__PUBLIC_URL__` filled in, run `blockpage_patch.py --install`, and add
 the cron line.
 
 ### Live updates

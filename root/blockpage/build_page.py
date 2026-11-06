@@ -23,6 +23,9 @@ except ImportError:  # Python 2
     from cgi import escape
 
 ROOT_DIR = '__ROOT_DIR__'
+# The Reward Time app's address; its tokenless /me page shows this device's
+# schedule and reward time (if a blocked device can reach it).
+PUBLIC_URL = '__PUBLIC_URL__'
 CACHE_DIR = os.path.join(ROOT_DIR, 'blockpage-cache')
 PAUSES_PATH = os.path.join(ROOT_DIR, 'pauses.json')
 SA_DB = '/usr/syno/etc/packages/SafeAccess/synoaccesscontrol/database.db'
@@ -156,7 +159,9 @@ def build(ip):
         rows.append(('Type', DEVICE_TYPES[dev_type]))
     table = ''.join('<tr><th>%s</th><td>%s</td></tr>' % (h(k), h(v)) for k, v in rows)
     page = PAGE % {'headline': h(headline), 'detail': '<p>%s</p>' % h(detail) if detail else '', 'ask': h(ask), 'name': h(name),
-                   'table': table, 'updated': h(clock(now))}
+                   'table': table, 'updated': h(clock(now)),
+                   'me_link': ('<p><a class="me" href="%s/me">See your schedule and reward time &rsaquo;</a></p>'
+                               % h(PUBLIC_URL)) if PUBLIC_URL.startswith('https://') else ''}
 
     if not os.path.isdir(CACHE_DIR):
         return
@@ -188,12 +193,14 @@ th, td { text-align: left; padding: 8px 0; border-top: 1px solid var(--line); ve
 th { color: var(--muted); font-weight: normal; width: 40%%; padding-right: 12px; }
 td { word-break: break-all; }
 .muted { color: var(--muted); font-size: 13px; margin-top: 16px; }
+a.me { color: var(--accent); font-weight: 600; text-decoration: none; }
 </style></head>
 <body><main><div class="card">
 <h1>No internet right now</h1>
 <p class="headline">%(headline)s</p>
 %(detail)s
 <p>%(ask)s</p>
+%(me_link)s
 <table>%(table)s</table>
 <p class="muted">Reward Time &middot; updated %(updated)s</p>
 </div></main></body></html>
