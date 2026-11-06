@@ -34,6 +34,9 @@ LEASES = '/etc/dhcpd/dhcpd.conf.leases'
 ARP = '/proc/net/arp'
 IP_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 MAC_RE = re.compile(r'^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+# Reward Time's icon, inline, so the page needs no second request (which a
+# blocked device would send to the blocked site, not here).
+ICON_URI = 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20128%20128%22%3E%0A%20%20%3Crect%20width%3D%22128%22%20height%3D%22128%22%20rx%3D%2228%22%20fill%3D%22%230a84ff%22/%3E%0A%20%20%3Crect%20x%3D%2252%22%20y%3D%2216%22%20width%3D%2224%22%20height%3D%2210%22%20rx%3D%225%22%20fill%3D%22%23eaf3ff%22/%3E%0A%20%20%3Ccircle%20cx%3D%2264%22%20cy%3D%2268%22%20r%3D%2240%22%20fill%3D%22none%22%20stroke%3D%22%23eaf3ff%22%20stroke-width%3D%228%22/%3E%0A%20%20%3Cline%20x1%3D%2264%22%20y1%3D%2268%22%20x2%3D%2264%22%20y2%3D%2244%22%20stroke%3D%22%23eaf3ff%22%20stroke-width%3D%227%22%20stroke-linecap%3D%22round%22/%3E%0A%20%20%3Cline%20x1%3D%2264%22%20y1%3D%2268%22%20x2%3D%2282%22%20y2%3D%2268%22%20stroke%3D%22%23eaf3ff%22%20stroke-width%3D%227%22%20stroke-linecap%3D%22round%22/%3E%0A%20%20%3Ccircle%20cx%3D%2298%22%20cy%3D%2294%22%20r%3D%2222%22%20fill%3D%22%2330d158%22/%3E%0A%20%20%3Cline%20x1%3D%2298%22%20y1%3D%2284%22%20x2%3D%2298%22%20y2%3D%22104%22%20stroke%3D%22%23052e13%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22/%3E%0A%20%20%3Cline%20x1%3D%2288%22%20y1%3D%2294%22%20x2%3D%22108%22%20y2%3D%2294%22%20stroke%3D%22%23052e13%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22/%3E%0A%3C/svg%3E'
 # The DS router app's device type icons, as words; others (e.g. "default") are left out.
 DEVICE_TYPES = {'tv': 'TV', 'nb': 'Laptop', 'pc': 'Computer', 'cellphone': 'Phone', 'ipad': 'Tablet',
                 'game': 'Game console', 'watch': 'Watch', 'printer': 'Printer', 'cam': 'Camera'}
@@ -159,7 +162,7 @@ def build(ip):
         rows.append(('Type', DEVICE_TYPES[dev_type]))
     table = ''.join('<tr><th>%s</th><td>%s</td></tr>' % (h(k), h(v)) for k, v in rows)
     page = PAGE % {'headline': h(headline), 'detail': '<p>%s</p>' % h(detail) if detail else '', 'ask': h(ask), 'name': h(name),
-                   'table': table, 'updated': h(clock(now)),
+                   'table': table, 'updated': h(clock(now)), 'icon': ICON_URI,
                    'me_link': ('<p><a class="me" href="%s/me">See your schedule and reward time &rsaquo;</a></p>'
                                % h(PUBLIC_URL)) if PUBLIC_URL.startswith('https://') else ''}
 
@@ -176,6 +179,7 @@ PAGE = u"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>No internet right now</title>
+<link rel="icon" href="%(icon)s">
 <style>
 :root { --bg: #f2f2f7; --card: #fff; --text: #1c1c1e; --muted: #6e6e73; --line: #d1d1d6; --accent: #0a84ff; }
 @media (prefers-color-scheme: dark) {

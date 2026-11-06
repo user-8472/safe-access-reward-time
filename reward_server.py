@@ -1720,7 +1720,7 @@ self.addEventListener('fetch', function(e) { e.respondWith(fetch(e.request)); })
 MY_DEVICE_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>My device - Reward Time</title>
-<link rel="icon" href="/icon.svg">
+<link rel="icon" href="__ICON_URI__">
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #111;
          color: #eee; margin: 0; }
@@ -1752,7 +1752,9 @@ MY_DEVICE_PAGE = """<!doctype html>
 <p class="foot" id="foot"></p>
 </main>
 <script>
-var data = null, fetchedAt = 0;
+// The first data comes inside the page, so it shows without a second request
+// (on a blocked device each new connection can stall for a long time).
+var data = __ME_DATA__, fetchedAt = Date.now();
 var DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 function esc(s) {
@@ -1873,21 +1875,39 @@ function render() {
   document.getElementById('foot').textContent = 'Reward Time \\u00b7 updated ' + clock(data.now);
 }
 
-function load() {
-  fetch('/api/me', {cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (j) {
-    data = j; fetchedAt = Date.now(); render();
-  }).catch(function () {
-    document.getElementById('foot').textContent = "Couldn't refresh - check the connection";
-  });
+// Refresh every 30 s; a request that hangs is abandoned after 10 s and a
+// failed one retried after 5 s, each on a fresh connection.
+var refreshTimer = null;
+function scheduleLoad(ms) {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(function () { if (!document.hidden) load(); }, ms);
 }
-load();
-setInterval(function () { if (!document.hidden) load(); }, 30000);
+function load() {
+  var ctrl = window.AbortController ? new AbortController() : null;
+  var abortTimer = ctrl ? setTimeout(function () { ctrl.abort(); }, 10000) : null;
+  fetch('/api/me', {cache: 'no-store', signal: ctrl ? ctrl.signal : undefined})
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      clearTimeout(abortTimer);
+      data = j; fetchedAt = Date.now(); render();
+      scheduleLoad(30000);
+    })
+    .catch(function () {
+      clearTimeout(abortTimer);
+      document.getElementById('foot').textContent = "Couldn't refresh - trying again";
+      scheduleLoad(5000);
+    });
+}
+if (data) { render(); scheduleLoad(30000); } else { load(); }
 setInterval(function () { if (!document.hidden) renderNow(); }, 1000);
 document.addEventListener('visibilitychange', function () { if (!document.hidden) load(); });
 </script>
 </body></html>
 """
 
+
+# The icon inline, for pages that should load with a single request.
+ICON_DATA_URI = 'data:image/svg+xml,' + urllib.quote(ICON_SVG.strip())
 
 LAUNCHER_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3769,7 +3789,14 @@ class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send_html('<h1>Not found</h1>', status=404)
                 return
             if parsed.path == '/me':
-                self._send_html(MY_DEVICE_PAGE)
+                page = MY_DEVICE_PAGE.replace('__ICON_URI__', ICON_DATA_URI).replace(
+                    '__ME_DATA__', json.dumps(my_device_status(ip)).replace('</', '<\\/'))
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
             else:
                 self._send_json(my_device_status(ip))
             return
